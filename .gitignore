@@ -2,3 +2,4 @@
 .vscode
 requirements.txt
 evsp-instances
+__pycache__

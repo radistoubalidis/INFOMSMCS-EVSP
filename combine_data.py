@@ -3,7 +3,7 @@ from io import StringIO
 import argparse
 import os
 
-def parse_trips(path):
+def parse_trips(path, verbose=0):
     with open(path, 'r', encoding='cp1252', errors='replace') as f:
         t_lines = [line for line in f if line.startswith('T;')]
     
@@ -26,11 +26,12 @@ def parse_trips(path):
     ]
     
     df_trips['distance_km'] = pd.to_numeric(df_trips['distance_km'], errors='coerce')
-    print(f'Parsed {path}')
-    print(df_trips.head())
+    if verbose == 1:
+        print(f'Parsed {path}')
+        print(df_trips.head())
     return df_trips
 
-def parse_dhd(path):
+def parse_dhd(path, verbose=0):
     # read text file and only keep deadhead records
     with open(path, "r", encoding="cp1252", errors="replace") as f:
         t_lines = [line for line in f if line.startswith("D;")]
@@ -53,11 +54,12 @@ def parse_dhd(path):
     df_deadheads["distance_km"] = pd.to_numeric(df_deadheads["distance_km"], errors="coerce")
     df_deadheads[["from_stop", "to_stop"]] = df_deadheads["from_stop-to_stop"].str.split("-", n=1, expand=True)
     
-    print(f"Parsed {path}")
-    print(df_deadheads.head())
+    if verbose == 1:
+        print(f"Parsed {path}")
+        print(df_deadheads.head())
     return df_deadheads
 
-def parse_parameters(path):
+def parse_parameters(path, verbose=0):
     with open(path, "r", encoding="cp1252", errors="replace") as f:
         t_lines = [line for line in f if line.startswith("U;")]
 
@@ -78,8 +80,9 @@ def parse_parameters(path):
         "battery_capacity_kwh"
     ]
     
-    print(f"Parsed {path}")
-    print(df_params.head())
+    if verbose == 1:
+        print(f"Parsed {path}")
+        print(df_params.head())
     return df_params
 
 
