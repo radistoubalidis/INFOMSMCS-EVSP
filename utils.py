@@ -2,53 +2,145 @@ from typing import Dict, List, Tuple, Any
 import pandas as pd
 import numpy as np
 import random
+import pulp
 
-def feasible_arcs(trips: pd.DataFrame, deadheads: pd.DataFrame, max_wait = 10):
+def build_deadhead_dict(df_deadheads):
+    dh_dict = {}
+
+    for row in df_deadheads.itertuples():
+        dh_dict[(row.from_stop, row.to_stop)] = (
+            row.time_ver_0,
+            row.time_ver_1,
+            row.time_ver_2,
+            row.time_ver_3
+        )
+
+    return dh_dict
+
+def feasible_arcs(trips, deadhead_dict, max_wait = 240):
     arcs = []
+    trips_list = list(trips.itertuples())
 
-    for i in trips.itertuples():
-        for j in trips.itertuples():
+    for i in trips_list:
+        for j in trips_list:
             if i.trip_number == j.trip_number:
                 continue
             
             if i.to_stop == j.from_stop:
                 travel_time = 0
             else:
-
-                dh = deadheads[(deadheads.from_stop == i.to_stop) & (deadheads.to_stop == j.from_stop)]
-
-                if dh.empty:
+                key = (i.to_stop, j.from_stop)
+                
+                if key not in deadhead_dict:
                     continue
 
-                travel_time = dh.iloc[0]["time_ver_0"]
+                t0, t1, t2, t3 = deadhead_dict[key]
+                
+                # check in which interval deadhead falls
+                if  331 <= i.end_time_min <= 419 or 541 <= i.end_time_min <= 899 or 1141 <= i.end_time_min <= 1439 or 1771 <= i.end_time_min <= 1859 or 1981 <= i.end_time_min <= 1999:
+                    travel_time = t0
+                elif 420 <= i.end_time_min <= 540 or 900 <= i.end_time_min <= 1140 or 1860 <= i.end_time_min <= 1980:
+                    travel_time = t1
+                elif 0 <= i.end_time_min <= 330 or 1440 <= i.end_time_min <= 1770:
+                    travel_time = t2
+                else:
+                    travel_time = t3
 
-            slack = j.start_time_min - (i.end_time_min + travel_time) # type:ignore
+            slack = j.start_time_min - (i.end_time_min + travel_time)
 
-            if 0 <= slack <= max_wait: # type:ignore
-                arcs.append((i.trip_number, j.trip_number))
+            if 0 <= slack <= max_wait:
+                arcs.append((i.trip_number, j.trip_number, travel_time, slack))
 
     return arcs
 
+def build_trip_graph(trips: pd.DataFrame, arcs):
+    """
+    arcs: list[(i_trip, j_trip, travel_time, slack)] from feasible_arcs
+    returns adjacency list: {trip: [successor_trips]}
+    """
+    graph = {}
+    for i, j, travel_time, slack in arcs:
+        if i not in graph:
+            graph[i] = {}
+        graph[i][j] = (travel_time, slack)
+    return graph
 
+
+
+# Column Generation Part
+def compute_block_cost(block, graph, fixed_cost=1000.0, time_cost_per_min = 0.1):
+    if len(block) <= 1:
+        return fixed_cost
+    total_time_cost = 0.0
+    for k in range(len(block)-1):
+        i,j = block[k],block[k+1]
+        travel_time, slack = graph[i][j]
+        total_time_cost += (travel_time + slack) * time_cost_per_min
+    return fixed_cost + total_time_cost
+
+def init_columns(trips):
+    cols = {}
+    for t in trips.trip_number:
+        cols[f"col_{t}"] = {
+            "trips": [t],
+            "cost": 1000.0
+        }
+    return cols
+
+def solve_master(trips, columns):
+    model = pulp.LpProblem("Master", pulp.LpMinimize)
+    x = {name: pulp.LpVariable(name, lowBound=0) for name in columns}
+    
+    model += pulp.lpSum(columns[name]['cost'] * x[name] for name in columns)
+    
+    trip_ids = trips.trip_number.tolist()
+    for t in trip_ids:
+        model += pulp.lpSum(x[name] for name,col in columns.items() if t in col['trips']) == 1, f"cover_{t}"
+    
+    model.solve(pulp.PULP_CBC_CMD(msg=False))
+    duals = {t: model.constraints[f"cover_{t}"].pi for t in trip_ids}
+    return model, duals
+
+
+def col_gen_step(trips, graph, columns, sub_problem='rl'):
+    model, duals = solve_master(trips, columns)
+    current_objective = pulp.value(model.objective)
+    
+    if sub_problem == 'rl':
+        env = EVSPPricingEnv(trips_df=trips, graph=graph, duals=duals)
+        block, reduced_cost = greedy_pi_policy(env)
+    elif sub_problem == 'metaheuristics':
+        pass
+    
+    print(f"Current obj: {current_objective:.2f}, Found block: {block}, reduced_cost: {reduced_cost:.3f}")
+    
+    if reduced_cost >= -1e-3:
+        print("No improvement found!")
+        return False, model, columns
+    
+    block_cost = compute_block_cost(block, graph)
+    col_name = f"col_{len(columns)}"
+    columns[col_name] = {
+        "trips": block,
+        "cost": block_cost
+    }
+    print(f"Added {col_name}: (cost={block:.1f})")
+    return True, model, columns
 
 class EVSPPricingEnv:
     def __init__(self, trips_df: pd.DataFrame, graph: Dict[int, List[int]], 
-                 duals: Dict[int, float], block_cost: float = 1.0, max_len: int = 20):
-        """
-        graph: {trip_id: [possible_next_trips]} from feasible_arcs()
-        duals: {trip_id: π_t} from solve_master()
-        """
+                 duals: Dict[int, float], block_cost: float = 1000.0, time_cost_per_min: float = 0.1, max_len: int = 30):
         self.trips = trips_df.set_index('trip_number')
-        self.graph = graph
+        self.graph = graph # {i_trip: (j_trip, travel_time, slack)}
         self.duals = duals
         self.block_cost = block_cost
+        self.time_cost_per_min = time_cost_per_min
         self.max_len = max_len
         
         # All possible trips
         self.all_trips = sorted(list(graph.keys()))
         self.trip_to_idx = {t: i for i, t in enumerate(self.all_trips)}
         self.n_trips = len(self.all_trips)
-        
         self.reset()
     
     def reset(self) -> Tuple[int, np.ndarray]:
@@ -57,28 +149,21 @@ class EVSPPricingEnv:
         self.block = []         
         self.visited_mask = np.zeros(self.n_trips, dtype=bool)
         self.steps = 0
+        self.cumulative_pi = 0.0
+        self.cumulative_time_cost = 0.0
         return self._get_state()
     
     def _get_state(self) -> Tuple[int, np.ndarray]:
-        """State = (current_trip_idx, visited_mask)"""
         curr_idx = -1 if self.current_trip is None else self.trip_to_idx[self.current_trip]
-        return curr_idx, self.visited_mask.copy()
+        return (curr_idx, self.visited_mask.copy(), self.cumulative_pi, self.cumulative_time_cost)
     
     def get_actions(self) -> List[Any]:
-        """Possible actions: next trips + STOP"""
         if self.current_trip is None:
-            # Can start at any unvisited trip
-            available = [t for t in self.all_trips if not self.visited_mask[self.trip_to_idx[t]]]
+            return [t for t in self.all_trips if not self.visited_mask[self.trip_to_idx[t]]]
         else:
-            # Successors of current trip
-            available = [t for t in self.graph[self.current_trip] 
-                        if not self.visited_mask[self.trip_to_idx[t]]]
-        
-        available.append("STOP")
-        return available
-    
-    def step(self, action: Any) -> Tuple[Tuple[int, np.ndarray], float, bool, Dict]:
-        """Take action, return next_state, reward, done, info"""
+           return list(self.graph[self.current_trip].keys())
+            
+    def step(self, action: Any):
         self.steps += 1
         reward = 0.0
         done = False
@@ -86,28 +171,36 @@ class EVSPPricingEnv:
         
         if action == "STOP" or self.steps >= self.max_len:
             # Terminal: compute reduced cost
-            sum_pi = sum(self.duals[t] for t in self.block)
-            reduced_cost = self.block_cost - sum_pi
-            # Reward = -(block_cost - sum(π_t)) = sum(π_t) - block_cost
+            reduced_cost = (self.block_cost + self.cumulative_time_cost) - self.cumulative_pi
             reward = -reduced_cost  
             done = True
             info = {
                 "block": self.block.copy(),
-                "sum_pi": sum_pi,
+                "sum_pi": self.cumulative_pi,
+                'total_time_cost': self.cumulative_time_cost,
                 "reduced_cost": reduced_cost,
                 "block_length": len(self.block)
             }
         else:
-            # Add trip to block
-            self.current_trip = action
-            self.block.append(action)
+            # add arc cost from previous trip
+            if self.current_trip is not None:
+                travel_time, slack = self.graph[self.current_trip][action]
+                arc_cost = (travel_time + slack) * self.time_cost_per_min
+                self.cumulative_time_cost += arc_cost
+            
+        self.current_trip = action
+        self.block.append(action)
+        self.cumulative_pi += self.duals[action]
+        
+        reward = self.duals[action] - (self.cumulative_time_cost / len(self.block))
+        if action in self.trip_to_idx:
             trip_idx = self.trip_to_idx[action]
             self.visited_mask[trip_idx] = True
         
         return self._get_state(), reward, done, info
 
 
-def random_policy(env) -> Tuple[List[int], float]:
+def random_policy(env: EVSPPricingEnv) -> Tuple[List[int], float]:
     """Random policy for testing (replace later with trained RL)"""
     state = env.reset()
     done = False
@@ -127,14 +220,14 @@ def greedy_pi_policy(env) -> Tuple[List[int], float]:
     while not done:
         actions = [a for a in env.get_actions() if a != "STOP"]
         if not actions:
-            # No more trips, stop
-            _, reward, done, info = env.step("STOP")
+            state, _, done, info = env.step("STOP")
             break
-            
-        # Pick highest π_t
-        action = max(actions, key=lambda t: env.duals[t])
-        state, reward, done, info = env.step(action)
+        
+        if env.current_trip is None:
+            action = max(actions, key=lambda t: env.duals[t])  
+        else:
+            action = max(actions, key=lambda j: env.duals[j] - env.graph[env.current_trip][j][0] * env.time_cost_per_min)
     
-    return info["block"], info["reduced_cost"]
-
-
+        state, _, done, info = env.step(action)
+    
+    return info['block'], info['reduced_cost']
