@@ -3,32 +3,138 @@ import pandas as pd
 import numpy as np
 import random
 
-def feasible_arcs(trips: pd.DataFrame, deadheads: pd.DataFrame, max_wait = 10):
-    arcs = []
+# def feasible_arcs(trips: pd.DataFrame, deadheads: pd.DataFrame, max_wait = 10):
+#     arcs = []
 
-    for i in trips.itertuples():
-        for j in trips.itertuples():
+#     for i in trips.itertuples():
+#         for j in trips.itertuples():
+#             if i.trip_number == j.trip_number:
+#                 continue
+            
+#             if i.to_stop == j.from_stop:
+#                 travel_time = 0
+#             else:
+
+#                 dh = deadheads[(deadheads.from_stop == i.to_stop) & (deadheads.to_stop == j.from_stop)]
+
+#                 if dh.empty:
+#                     continue
+
+#                 travel_time = dh.iloc[0]["time_ver_0"]
+
+#             slack = j.start_time_min - (i.end_time_min + travel_time) # type:ignore
+
+#             if 0 <= slack <= max_wait: # type:ignore
+#                 arcs.append((i.trip_number, j.trip_number))
+
+#     return arcs
+
+
+# build deadhead dictionary
+def build_deadhead_dict(deadheads: pd.DataFrame):
+    dh_dict = {}
+
+    for row in deadheads.itertuples():
+        dh_dict[(row.from_stop, row.to_stop)] = {
+            "t0": row.time_ver_0,
+            "t1": row.time_ver_1,
+            "t2": row.time_ver_2,
+            "t3": row.time_ver_3,
+            "distance_km": row.distance_km
+        }
+
+    return dh_dict
+
+# check in which time interval deadheads fall into
+def get_deadhead_time(time_min, dh):
+    if  331 <= time_min <= 419 or 541 <= time_min <= 899 or 1141 <= time_min <= 1439 or 1771 <= time_min <= 1859 or 1981 <= time_min <= 1999:
+        return dh["t0"]
+    elif 420 <= time_min <= 540 or 900 <= time_min <= 1140 or 1860 <= time_min <= 1980:
+        return dh["t1"]
+    elif 0 <= time_min <= 330 or 1440 <= time_min <= 1770:
+        return dh["t2"]
+    else:
+        return dh["t3"]
+
+# calculate all feasible deadheads
+def feasible_arcs(trips: pd.DataFrame, deadhead_dict, depot_stop= "utrgar", max_wait = 240):
+    arcs = []
+    trips_list = list(trips.itertuples())
+
+    # feasible arcs depot -> trips
+    for j in trips_list:
+        if depot_stop == j.from_stop:
+            travel_time = 0
+        else:
+            key = (depot_stop, j.from_stop)
+            if key not in deadhead_dict:
+                continue
+
+            dh = deadhead_dict[key]
+            travel_time = dh["t1"] # for the DH from depot to first trip take time with highest value
+            distance_km = dh["distance_km"]
+        
+        arcs.append({
+            "arc_type": "pull_out",
+            "from_stop": "DEPOT",
+            "to_stop": j.trip_number,
+            "travel_time": travel_time,
+            "distance_km" : distance_km,
+            "slack": None
+        })
+
+    # feasible arcs trips -> trips
+    for i in trips_list:
+        for j in trips_list:
             if i.trip_number == j.trip_number:
                 continue
             
             if i.to_stop == j.from_stop:
                 travel_time = 0
             else:
-
-                dh = deadheads[(deadheads.from_stop == i.to_stop) & (deadheads.to_stop == j.from_stop)]
-
-                if dh.empty:
+                key = (i.to_stop, j.from_stop)
+                
+                if key not in deadhead_dict:
                     continue
 
-                travel_time = dh.iloc[0]["time_ver_0"]
+                dh = deadhead_dict[key]
+                travel_time = get_deadhead_time[i.end_time_min, dh]
+                distance_km = dh["distance_km"]
 
-            slack = j.start_time_min - (i.end_time_min + travel_time) # type:ignore
+            slack = j.start_time_min - (i.end_time_min + travel_time)
 
-            if 0 <= slack <= max_wait: # type:ignore
-                arcs.append((i.trip_number, j.trip_number))
+            if 0 <= slack <= max_wait:
+                arcs.append({
+                    "arc_type": "tripDH",
+                    "from_stop": i.trip_number,
+                    "to_stop": j.trip_number,
+                    "travel_time": travel_time,
+                    "distance_km" : distance_km,
+                    "slack": slack
+                })
 
+    # feasible arcs trips -> depot
+    for i in trips_list:
+        if i.to_stop == depot_stop:
+            travel_time = 0
+        else:
+            key = (i.to_stop, depot_stop)
+            if key not in deadhead_dict:
+                continue
+            dh_row = deadhead_dict[key]
+            travel_time = get_deadhead_time(i.end_time_min, dh_row)
+            distance_km = dh["distance_km"]
+
+        arcs.append({
+            "arc_type": "pull_in",
+            "from_stop": i.trip_number,
+            "to_stop": "DEPOT",
+            "travel_time": travel_time,
+            "distance_km" : distance_km,
+            "slack": None
+        })
+        
     return arcs
-
 
 
 class EVSPPricingEnv:
