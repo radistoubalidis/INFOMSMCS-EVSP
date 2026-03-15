@@ -5,33 +5,6 @@ import numpy as np
 import random
 import pulp
 
-# def feasible_arcs(trips: pd.DataFrame, deadheads: pd.DataFrame, max_wait = 10):
-#     arcs = []
-
-#     for i in trips.itertuples():
-#         for j in trips.itertuples():
-#             if i.trip_number == j.trip_number:
-#                 continue
-            
-#             if i.to_stop == j.from_stop:
-#                 travel_time = 0
-#             else:
-
-#                 dh = deadheads[(deadheads.from_stop == i.to_stop) & (deadheads.to_stop == j.from_stop)]
-
-#                 if dh.empty:
-#                     continue
-
-#                 travel_time = dh.iloc[0]["time_ver_0"]
-
-#             slack = j.start_time_min - (i.end_time_min + travel_time) # type:ignore
-
-#             if 0 <= slack <= max_wait: # type:ignore
-#                 arcs.append((i.trip_number, j.trip_number))
-
-#     return arcs
-
-
 # build deadhead dictionary
 def build_deadhead_dict(deadheads: pd.DataFrame):
     dh_dict = {}
@@ -67,6 +40,7 @@ def feasible_arcs(trips: pd.DataFrame, deadhead_dict, depot_stop= "utrgar", max_
     for j in trips_list:
         if depot_stop == j.from_stop:
             travel_time = 0
+            distance_km = 0
         else:
             key = (depot_stop, j.from_stop)
             if key not in deadhead_dict:
@@ -78,7 +52,7 @@ def feasible_arcs(trips: pd.DataFrame, deadhead_dict, depot_stop= "utrgar", max_
         
         arcs.append({
             "arc_type": "pull_out",
-            "from_stop": "DEPOT",
+            "from_stop": 0, # Depot -> 0
             "to_stop": j.trip_number,
             "travel_time": travel_time,
             "distance_km" : distance_km,
@@ -100,7 +74,7 @@ def feasible_arcs(trips: pd.DataFrame, deadhead_dict, depot_stop= "utrgar", max_
                     continue
 
                 dh = deadhead_dict[key]
-                travel_time = get_deadhead_time[i.end_time_min, dh]
+                travel_time = get_deadhead_time(i.end_time_min, dh)
                 distance_km = dh["distance_km"]
 
             slack = j.start_time_min - (i.end_time_min + travel_time)
@@ -130,7 +104,7 @@ def feasible_arcs(trips: pd.DataFrame, deadhead_dict, depot_stop= "utrgar", max_
         arcs.append({
             "arc_type": "pull_in",
             "from_stop": i.trip_number,
-            "to_stop": "DEPOT",
+            "to_stop": 0, # Depot -> 0
             "travel_time": travel_time,
             "distance_km" : distance_km,
             "slack": None
@@ -139,9 +113,9 @@ def feasible_arcs(trips: pd.DataFrame, deadhead_dict, depot_stop= "utrgar", max_
     return arcs
 
 def build_trip_graph_from_arcs_df(trips: pd.DataFrame, arcs_df: pd.DataFrame):
-    graph = {t: [] for t in trips.trip_number.unique() if t not in [1190,1192,1194]}
+    graph = {t: [] for t in trips.trip_number.unique()}
 
-    compat_df = arcs_df[arcs_df["arc_type"] == "tripDH"]
+    compat_df = arcs_df[(arcs_df["arc_type"] == "tripDH")]
 
     for row in compat_df.itertuples(index=False):
         graph[row.from_stop].append((row.to_stop, row.travel_time, row.slack, row.distance_km))
@@ -151,20 +125,32 @@ def build_trip_graph_from_arcs_df(trips: pd.DataFrame, arcs_df: pd.DataFrame):
 
 
 # Column Generation Part
-def compute_block_cost(block, graph, fixed_cost=1000.0, time_cost_per_min = 0.1):
+def compute_block_cost(block, graph, fixed_cost=1000.0, time_cost_per_min = 0.001):
     if len(block) <= 1:
         return fixed_cost
+    
     total_time_cost = 0.0
     for k in range(len(block)-1):
-        i,j = block[k],block[k+1]
-        travel_time, slack = graph[i][j]
-        total_time_cost += (travel_time + slack) * time_cost_per_min
+        i_trip, j_trip = block[k], block[k+1]
+        
+        # Find arc (i_trip → j_trip) in graph[i_trip]
+        arc_found = False
+        for candidate_trip, travel_time, slack, distance in graph.get(i_trip, []):
+            if candidate_trip == j_trip:
+                total_time_cost += (travel_time + slack) * time_cost_per_min
+                arc_found = True
+                break
+        
+        # If no explicit arc (same-stop connection), assume zero cost
+        if not arc_found:
+            total_time_cost += 0.0  # or some default cost
+    
     return fixed_cost + total_time_cost
 
 def init_columns(trips):
     cols = {}
     for t in trips.trip_number:
-        cols[f"col_{t}"] = {
+        cols[f"col_{len(cols.keys())}"] = {
             "trips": [t],
             "cost": 1000.0
         }
@@ -174,15 +160,26 @@ def solve_master(trips, columns):
     model = pulp.LpProblem("Master", pulp.LpMinimize)
     x = {name: pulp.LpVariable(name, lowBound=0) for name in columns}
     
+    # Objective
     model += pulp.lpSum(columns[name]['cost'] * x[name] for name in columns)
     
+    # Constraints WITHOUT NAMES - PuLP auto-generates unique names
     trip_ids = trips.trip_number.tolist()
+    constraints = []
     for t in trip_ids:
-        model += pulp.lpSum(x[name] for name,col in columns.items() if t in col['trips']) == 1, f"cover_{t}"
+        constraint = pulp.lpSum(x[name] for name,col in columns.items() if t in col['trips']) == 1
+        model += constraint
+        constraints.append(constraint)
     
     model.solve(pulp.PULP_CBC_CMD(msg=False))
-    duals = {t: model.constraints[f"cover_{t}"].pi for t in trip_ids}
+    
+    # Extract duals using constraint indices
+    duals = {}
+    for idx, t in enumerate(trip_ids):
+        duals[t] = constraints[idx].pi
+    
     return model, duals
+
 
 
 def col_gen_step(trips, graph, columns, sub_problem='rl'):
@@ -207,7 +204,7 @@ def col_gen_step(trips, graph, columns, sub_problem='rl'):
         "trips": block,
         "cost": block_cost
     }
-    print(f"Added {col_name}: (cost={block:.1f})")
+    print(f"Added {col_name}: (cost={block})")
     return True, model, columns
 
 class EVSPPricingEnv:
@@ -264,18 +261,19 @@ class EVSPPricingEnv:
                 "reduced_cost": reduced_cost,
                 "block_length": len(self.block)
             }
-        else:
-            # add arc cost from previous trip
-            if self.current_trip is not None:
-                travel_time, slack, distance = action[1], action[2], action[3]
-                arc_cost = (travel_time + slack) * self.time_cost_per_min
-                self.cumulative_time_cost += arc_cost
-            
+            return self._get_state(), reward, done, info
+        
+        # add arc cost from previous trip
+        if self.current_trip is not None:
+            travel_time, slack, distance = action[1], action[2], action[3]
+            arc_cost = (travel_time + slack) * self.time_cost_per_min
+            self.cumulative_time_cost += arc_cost
+        
         self.current_trip = action
         self.block.append(action)
         self.cumulative_pi += self.duals[action[0]]
         
-        reward = self.duals[action[0]] - (self.cumulative_time_cost / len(self.block))
+        reward = self.duals[action[0]] - (self.cumulative_time_cost / len(self.block)) if action != 'STOP' else 1
         if action in self.trip_to_idx:
             trip_idx = self.trip_to_idx[action[0]]
             self.visited_mask[trip_idx] = True
@@ -295,6 +293,11 @@ def random_policy(env: EVSPPricingEnv) -> Tuple[List[int], float]:
     
     return info["block"], info["reduced_cost"]
 
+def score_action(env, action):
+    return env.duals[action[0]] \
+        - env.time_cost_per_min * action[1] \
+        - env.time_cost_per_min * action[2]
+
 def greedy_pi_policy(env) -> Tuple[List[int], float]:
     """Greedy: always pick highest π_t successor"""
     state = env.reset()
@@ -307,10 +310,10 @@ def greedy_pi_policy(env) -> Tuple[List[int], float]:
             break
         
         if env.current_trip is None:
-            action = max(actions, key=lambda t: env.duals[t])  
+            action = max(actions, key=lambda t: env.duals[t[0]])  
         else:
-            action = max(actions, key=lambda j: env.duals[j] - env.graph[env.current_trip][j][0] * env.time_cost_per_min)
+            action = max(actions, key=lambda t: score_action(env, t))
     
-        state, _, done, info = env.step(action)
+        state, reward, done, info = env.step(action)
     
     return info['block'], info['reduced_cost']
