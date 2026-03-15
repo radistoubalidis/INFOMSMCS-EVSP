@@ -159,26 +159,21 @@ def init_columns(trips):
 def solve_master(trips, columns):
     model = pulp.LpProblem("Master", pulp.LpMinimize)
     x = {name: pulp.LpVariable(name, lowBound=0) for name in columns}
-    
-    # Objective
     model += pulp.lpSum(columns[name]['cost'] * x[name] for name in columns)
     
-    # Constraints WITHOUT NAMES - PuLP auto-generates unique names
     trip_ids = trips.trip_number.tolist()
-    constraints = []
+    named_constraints = {}
     for t in trip_ids:
         constraint = pulp.lpSum(x[name] for name,col in columns.items() if t in col['trips']) == 1
-        model += constraint
-        constraints.append(constraint)
+        model += constraint, f"cover_trip_{t}"  # ← THIS FIX
+        named_constraints[t] = model.constraints[f"cover_trip_{t}"]
     
     model.solve(pulp.PULP_CBC_CMD(msg=False))
     
-    # Extract duals using constraint indices
-    duals = {}
-    for idx, t in enumerate(trip_ids):
-        duals[t] = constraints[idx].pi
-    
+    duals = {t: named_constraints[t].pi for t in trip_ids}  # ← REAL DUALS
+    print(f"Dual range: {min(duals.values()):.3f}-{max(duals.values()):.3f}")
     return model, duals
+
 
 
 
@@ -188,7 +183,10 @@ def col_gen_step(trips, graph, columns, sub_problem='rl'):
     
     if sub_problem == 'rl':
         env = EVSPPricingEnv(trips_df=trips, graph=graph, duals=duals)
-        block, reduced_cost = greedy_pi_policy(env)
+        if np.random.random() < 0.1:
+            block, reduced_cost = random_policy(env)
+        else:
+            block, reduced_cost = greedy_pi_policy(env)
     elif sub_problem == 'metaheuristics':
         pass
     
@@ -250,7 +248,6 @@ class EVSPPricingEnv:
         info = {}
         
         if action == "STOP" or self.steps >= self.max_len:
-            # Terminal: compute reduced cost
             reduced_cost = (self.block_cost + self.cumulative_time_cost) - self.cumulative_pi
             reward = -reduced_cost  
             done = True
@@ -263,21 +260,29 @@ class EVSPPricingEnv:
             }
             return self._get_state(), reward, done, info
         
-        # add arc cost from previous trip
+        # Extract trip_num from action (tuple or int)
+        if isinstance(action, tuple):
+            trip_num = action[0]
+            travel_time, slack = action[1], action[2]
+        else:
+            trip_num = action
+            travel_time, slack = 0, 0 
+        
+        # Add arc cost
         if self.current_trip is not None:
-            travel_time, slack, distance = action[1], action[2], action[3]
             arc_cost = (travel_time + slack) * self.time_cost_per_min
             self.cumulative_time_cost += arc_cost
+            
+        self.current_trip = (trip_num,)
+        self.block.append(trip_num)
+        self.cumulative_pi += self.duals[trip_num]  # Use trip_num
         
-        self.current_trip = action
-        self.block.append(action)
-        self.cumulative_pi += self.duals[action[0]]
+        reward = self.duals[trip_num] - (self.cumulative_time_cost / len(self.block))
         
-        reward = self.duals[action[0]] - (self.cumulative_time_cost / len(self.block)) if action != 'STOP' else 1
-        if action in self.trip_to_idx:
-            trip_idx = self.trip_to_idx[action[0]]
-            self.visited_mask[trip_idx] = True
-        
+        # Update visited mask
+        if trip_num in self.trip_to_idx:
+            self.visited_mask[self.trip_to_idx[trip_num]] = True
+            
         return self._get_state(), reward, done, info
 
 
@@ -288,6 +293,9 @@ def random_policy(env: EVSPPricingEnv) -> Tuple[List[int], float]:
     
     while not done:
         actions = env.get_actions()
+        if not actions:  
+            state, reward, done, info = env.step("STOP")
+            break
         action = random.choice(actions)
         state, reward, done, info = env.step(action)
     

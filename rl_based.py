@@ -44,7 +44,7 @@ def main():
     graph = build_trip_graph_from_arcs_df(trips, arcs_df)
     UTR_trips = 'utr/trips.txt'
     columns = init_columns(trips)
-    max_iter = 30
+    max_iter = 10000
     
     for i in range(max_iter):
         improved, model, columns = col_gen_step(trips, graph, columns)
