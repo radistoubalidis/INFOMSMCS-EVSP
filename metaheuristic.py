@@ -1,40 +1,9 @@
 from combine_data import parse_dhd, parse_parameters, parse_trips
-from utils import (
-    feasible_arcs,
-    build_deadhead_dict,
-    init_columns,
-    build_trip_graph_from_arcs_df,
-    col_gen_step,
-)
-from rl_based import solve_final_integer_master
+from utils import feasible_arcs, build_deadhead_dict,init_columns, build_trip_graph_from_arcs_df, col_gen_step, solve_final_integer_master, rebuild_columns_with_real_costs
 import pandas as pd
 import pulp
-print("Script started")
+import copy
 
-def solve_final_integer_master(trips, columns):
-    model = pulp.LpProblem("FinalIntegerMaster", pulp.LpMinimize)
-
-    x = {
-        name: pulp.LpVariable(name, lowBound=0, upBound=1, cat="Binary")
-        for name in columns
-    }
-
-    model += pulp.lpSum(columns[name]["cost"] * x[name] for name in columns)
-
-    trip_ids = trips.trip_number.tolist()
-    for t in trip_ids:
-        model += pulp.lpSum(
-            x[name] for name, col in columns.items() if t in col["trips"]
-        ) == 1, f"cover_{t}"
-
-    model.solve(pulp.PULP_CBC_CMD(msg=False))
-    return model
-
-def build_trip_km_lookup(trips: pd.DataFrame):
-    return {
-        row.trip_number: row.distance_km
-        for row in trips.itertuples(index=False)
-    }
 
 def main():
     UTR_trips = 'utr/trips.txt'
@@ -44,56 +13,104 @@ def main():
     UTR_params = 'utr/parameters.txt'
     params = parse_parameters(UTR_params)
     deadheads = build_deadhead_dict(dhd)
-    arcs = feasible_arcs(trips, deadheads, depot_stop = "utrgar", max_wait = 1000)
+    arcs = feasible_arcs(trips, deadheads, depot_stop = "nwggar")
     arcs_df = pd.DataFrame(arcs)
     graph = build_trip_graph_from_arcs_df(trips, arcs_df)
     columns = init_columns(trips)
-    max_iter = 10
+    
+    best_bus_count = float("inf")
+    best_cost = float("inf")
+    best_solution = None
+    best_columns = None
 
-    for i in range(max_iter):
-        print(f"\n--- Column generation iteration {i+1} ---")
-        improved, model, columns = col_gen_step(
+    no_improve_rounds = 0
+
+    step = 5
+    max_iters = 20
+
+    print("\nStarting column generation search")
+
+    # Try different CG iteration limits
+    for target_iter in range(step, max_iters + step, step):
+
+        print(f"\n=== Running CG with {target_iter} iterations ===")
+
+        # restart from scratch for this target iteration count
+        columns = init_columns(trips)
+
+        # run CG
+        for i in range(target_iter):
+            # one CG step
+            improved, model, columns = col_gen_step(trips=trips, graph=graph, columns=columns, sub_problem="metaheuristics")
+
+            if not improved:
+                print("No improving column found.")
+                break
+
+        print(f"Total columns generated: {len(columns)}")
+
+
+        # rebuild column costs using real cost values
+        real_columns = rebuild_columns_with_real_costs(
             trips=trips,
             graph=graph,
             columns=columns,
-            sub_problem="metaheuristics"
+            real_fixed_cost=244.13,
+            cost_per_km=0.13
         )
-        if not improved:
+
+        # solve the problem using binary variables
+        final_model = solve_final_integer_master(trips, real_columns)
+
+        # count number of buses used in solution
+        bus_count = sum(
+            1 for var in final_model.variablesDict().values()
+            if var.varValue is not None and var.varValue > 0.5
+        )
+
+        # compute total cost
+        cost = pulp.value(final_model.objective)
+
+        print(f"Result with {target_iter} CG iterations -> buses={bus_count}, cost={cost:.2f}")
+
+        improved_solution = False
+
+        # minimize number of buses first, then then the costs if number of buses are equal
+        if bus_count < best_bus_count:
+            improved_solution = True
+        elif bus_count == best_bus_count and cost < best_cost:
+            improved_solution = True
+
+        # store best solution
+        if improved_solution:
+            best_bus_count = bus_count
+            best_cost = cost
+            best_solution = {
+                name: var.varValue
+                for name, var in final_model.variablesDict().items()
+            }
+            best_columns = copy.deepcopy(real_columns)
+            no_improve_rounds = 0
+            print("New best solution found!")
+        else:
+            no_improve_rounds += 1
+            print(f"No improvement round {no_improve_rounds}/3")
+
+        # stop search if no improvement for 3 iterations
+        if no_improve_rounds >= 3:
+            print("\nStopping search: no improvement for 3 rounds.")
             break
 
-    final_model = solve_final_integer_master(trips, columns)
+    if best_solution is not None:
+        for name, value in best_solution.items():
+            if value is not None and value > 0.5:
+                print(name, best_columns[name]["trips"])
 
-    print("\nFinished column generation.")
-    print(f"Final integer objective = {pulp.value(final_model.objective):.2f}")
-
-    selected_columns = []
-    for name, var in final_model.variablesDict().items():
-        if var.varValue is not None and var.varValue > 0.5:
-            selected_columns.append((name, columns[name]["trips"], columns[name]["cost"]))
-
-    print("\nFinal columns used:")
-    for name, trips_in_col, cost in selected_columns:
-        print(f"{name}: cost={cost:.2f}, trips={trips_in_col}")
-
-    num_buses = len(selected_columns)
-    print(f"\nNumber of buses used: {num_buses}")
-
-
-    non_singletons = [col for col in columns.values() if len(col["trips"]) > 1]
-    print("Total columns:", len(columns))
-    print("Non-singleton columns:", len(non_singletons))
-    print("Singleton columns:", sum(1 for col in columns.values() if len(col["trips"]) == 1))
-    selected_singletons = 0
-    selected_non_singletons = 0
-
-    for name, var in final_model.variablesDict().items():
-        if var.varValue > 0.5:
-            if len(columns[name]["trips"]) == 1:
-                selected_singletons += 1
-            else:
-                selected_non_singletons += 1
-
-    print("Selected singleton columns:", selected_singletons)
-    print("Selected non-singleton columns:", selected_non_singletons)   
+    print("\nBest solution found:")
+    print(f"Total trips: {len(trips)}")
+    print(f"Buses used: {best_bus_count}")
+    print(f"Total cost: {best_cost:.2f}")
+    
+            
 if __name__ == '__main__':
     main()

@@ -5,32 +5,17 @@ import random
 import pulp
 import math
 
-# def feasible_arcs(trips: pd.DataFrame, deadheads: pd.DataFrame, max_wait = 10):
-#     arcs = []
+def solve_final_integer_master(trips, columns):
+    model = pulp.LpProblem("FinalMaster", pulp.LpMinimize)
+    x = {name: pulp.LpVariable(name, cat="Binary") for name in columns}
 
-#     for i in trips.itertuples():
-#         for j in trips.itertuples():
-#             if i.trip_number == j.trip_number:
-#                 continue
-            
-#             if i.to_stop == j.from_stop:
-#                 travel_time = 0
-#             else:
+    model += pulp.lpSum(columns[name]["cost"] * x[name] for name in columns)
 
-#                 dh = deadheads[(deadheads.from_stop == i.to_stop) & (deadheads.to_stop == j.from_stop)]
-
-#                 if dh.empty:
-#                     continue
-
-#                 travel_time = dh.iloc[0]["time_ver_0"]
-
-#             slack = j.start_time_min - (i.end_time_min + travel_time) # type:ignore
-
-#             if 0 <= slack <= max_wait: # type:ignore
-#                 arcs.append((i.trip_number, j.trip_number))
-
-#     return arcs
-
+    trip_ids = trips.trip_number.drop_duplicates().tolist()
+    for t in trip_ids:
+        model += pulp.lpSum(x[name] for name, col in columns.items() if t in col["trips"]) == 1, f"cover_{t}"
+    model.solve(pulp.PULP_CBC_CMD(msg=False))
+    return model
 
 # build deadhead dictionary
 def build_deadhead_dict(deadheads: pd.DataFrame):
@@ -143,7 +128,7 @@ def feasible_arcs(trips: pd.DataFrame, deadhead_dict, depot_stop="utrgar", max_w
     return arcs
 
 def build_trip_graph_from_arcs_df(trips: pd.DataFrame, arcs_df: pd.DataFrame):
-    graph = {t: [] for t in trips.trip_number.unique() if t not in [1190,1192,1194]}
+    graph = {t: [] for t in trips.trip_number.unique()}
 
     compat_df = arcs_df[arcs_df["arc_type"] == "tripDH"]
 
@@ -166,7 +151,7 @@ def build_arc_lookup_from_graph(graph):
 
 
 # Column Generation Part
-def compute_block_cost(block, graph, trip_km, fixed_cost=244.13, cost_per_km=0.13):
+def compute_block_cost(block, graph, trip_km, fixed_cost=1000.0, cost_per_km=0.13):
     if len(block) == 0:
         return 0.0
     if len(block) == 1:
@@ -206,7 +191,7 @@ def init_columns(trips):
     for t in trips.trip_number:
         cols[f"col_{t}"] = {
             "trips": [t],
-            "cost": 1000.0
+            "cost": 244.13
         }
     return cols
 
@@ -216,7 +201,7 @@ def solve_master(trips, columns):
     
     model += pulp.lpSum(columns[name]['cost'] * x[name] for name in columns)
     
-    trip_ids = trips.trip_number.tolist()
+    trip_ids = trips.trip_number.drop_duplicates().tolist()
     for t in trip_ids:
         model += pulp.lpSum(x[name] for name,col in columns.items() if t in col['trips']) == 1, f"cover_{t}"
     
@@ -237,11 +222,7 @@ def col_gen_step(trips, graph, columns, sub_problem="rl"):
         new_blocks = [(block, reduced_cost)] if block and reduced_cost < -1e-3 else []
 
     elif sub_problem == "metaheuristics":
-        new_blocks = pricing_multi_columns(
-            trips=trips,
-            graph=graph,
-            duals=duals
-        )
+        new_blocks = pricing_multi_columns( trips=trips, graph=graph, duals=duals)
 
     else:
         raise ValueError(f"Unknown sub_problem: {sub_problem}")
@@ -383,49 +364,53 @@ def greedy_pi_policy(env) -> Tuple[List[int], float]:
     return info['block'], info['reduced_cost']
 
 class ALNSPricingEnv:
-    def __init__(
-        self,
-        trips_df: pd.DataFrame,
-        graph: Dict[int, List[Tuple[int, float, float, float]]],
-        duals: Dict[int, float],
-        block_cost: float = 1000.0,
-        time_cost_per_min: float = 0.1,
-        max_iter: int = 40,
-        candidate_pool_size: int = 30,
-        reaction_factor: float = 0.2,
-        segment_length: int = 10,
-        seed: int = 42,
+    def __init__(self, trips_df: pd.DataFrame, graph: Dict[int, List[Tuple[int, float, float, float]]],
+        duals: Dict[int, float],block_cost: float = 244.13, cost_per_km: float = 0.13, max_iter: int = 40,
+        candidate_pool_size: int = 30, reaction_factor: float = 0.2, segment_length: int = 10, seed: int = 42,
     ):
         self.trips = trips_df.set_index("trip_number")
         self.graph = graph
         self.duals = duals
         self.block_cost = block_cost
-        self.time_cost_per_min = time_cost_per_min
+        self.cost_per_km = cost_per_km
+        
+        # ALNS controls
         self.max_iter = max_iter
         self.candidate_pool_size = candidate_pool_size
         self.reaction_factor = reaction_factor
         self.segment_length = segment_length
         self.random = random.Random(seed)
+
+        # find trip distances
         self.trip_km = {
-        row.trip_number: row.distance_km
-        for row in trips_df.itertuples(index=False)
+            row.trip_number: row.distance_km
+            for row in trips_df.itertuples(index=False)
         }
-        self.cost_per_km = 0.13
 
         self.trip_ids = trips_df.trip_number.tolist()
+
+        # sucessor lookup: trip i -> set of feasible next trips
         self.successors = {i: {j for j, _, _, _ in nbrs} for i, nbrs in graph.items()}
+
+        # deadhead lookup
         self.arc_lookup = build_arc_lookup_from_graph(graph)
 
-        # lightweight neighborhoods
+        # destroy operators for ALNS to remove part of block
         self.destroy_ops = {
             "random_remove": self.destroy_random,
             "segment_remove": self.destroy_segment,
+            "worst_remove": self.destroy_worst,
         }
-
+ 
+        # repair operators for ALNS to rebuild block after destruction
         self.repair_ops = {
             "greedy_insert": self.repair_first_improving,
+            "best_insert": self.repair_best_insertion,
+            "regret2_insert": self.repair_regret2,
+
         }
 
+        # ALNS adaptive weights: initially all weigths are the same, later ALNS adapts the weights
         self.destroy_weights = {k: 1.0 for k in self.destroy_ops}
         self.repair_weights = {k: 1.0 for k in self.repair_ops}
 
@@ -435,15 +420,20 @@ class ALNSPricingEnv:
         self.destroy_attempts = {k: 0 for k in self.destroy_ops}
         self.repair_attempts = {k: 0 for k in self.repair_ops}
 
+
     def is_feasible(self, block: List[int]) -> bool:
+        "Check whether all consecutive trips in the block are compatible"
         if not block:
             return False
+        
         for k in range(len(block) - 1):
             if block[k + 1] not in self.successors.get(block[k], set()):
                 return False
+            
         return True
 
     def block_cost_value(self, block: List[int]) -> float:
+        "Cost of one block: fixed bus cost + variable cost per km * (trip distance + deadheads)"
         return compute_block_cost(
             block,
             self.graph,
@@ -453,19 +443,22 @@ class ALNSPricingEnv:
         )
 
     def reduced_cost(self, block: List[int]) -> float:
+        "Reduced cost = real block cost - sum of duals of covered trips"
         if not self.is_feasible(block):
             return float("inf")
         return self.block_cost_value(block) - sum(self.duals.get(t, 0.0) for t in block)
 
     def candidate_trips(self) -> List[int]:
+        "All trips are used as ALNS candidate trips"
         return self.trip_ids.copy()
     
     def initial_solution(self) -> List[int]:
+        "Build the starting block for ALNS"
         candidates = self.candidate_trips()
         if not candidates:
             return []
 
-        # try several seeds, keep the best block found
+        # pick the top 10 trips with highest dual values
         seed_list = sorted(candidates, key=lambda t: self.duals.get(t, 0.0), reverse=True)[:10]
         best_block = [seed_list[0]]
         best_rc = self.reduced_cost(best_block)
@@ -474,6 +467,8 @@ class ALNSPricingEnv:
             block = [seed]
 
             improved = True
+
+            # greedily extend the 1 trip block by adding successor if it improves reduced cost
             while improved:
                 improved = False
                 last = block[-1]
@@ -491,6 +486,7 @@ class ALNSPricingEnv:
                         improved = True
                         break
 
+            # keep the best seed-generated block
             rc = self.reduced_cost(block)
             if rc < best_rc:
                 best_block = block
@@ -499,6 +495,7 @@ class ALNSPricingEnv:
         return best_block
 
     def destroy_random(self, block: List[int], q: int = None) -> List[int]:
+        "Randomly remove one or two trips from the current block"
         if len(block) <= 1:
             return block.copy()
 
@@ -511,9 +508,11 @@ class ALNSPricingEnv:
         partial = block.copy()
         for idx in idxs:
             partial.pop(idx)
+
         return partial
 
     def destroy_segment(self, block: List[int], q: int = None) -> List[int]:
+        "Remove one contiguous segment from the current block"
         if len(block) <= 1:
             return block.copy()
 
@@ -522,9 +521,28 @@ class ALNSPricingEnv:
 
         q = min(q, len(block) - 1)
         start = self.random.randint(0, len(block) - q)
+
         return block[:start] + block[start + q:]
+    
+    def destroy_worst(self, block: List[int], q: int = None) -> List[int]:
+        " Remove trips with lowest dual values (worst) from the current block"
+        if len(block) <= 1:
+            return block.copy()
+
+        if q is None:
+            q = 1 if len(block) < 4 else 2
+
+        q = min(q, len(block) - 1)
+
+        scored = [(self.duals.get(t, 0.0), t) for t in block]
+        scored.sort()  # lowest dual first
+
+        to_remove = {t for _, t in scored[:q]}
+
+        return [t for t in block if t not in to_remove]
 
     def repair_first_improving(self, partial_block: List[int]) -> List[int]:
+        "Repair a partial block by trying to insert trips in a random order, stops at immediately if reduced cost improves"
         candidates = self.candidate_trips()
         current = partial_block.copy()
         remaining = [t for t in candidates if t not in current]
@@ -539,7 +557,7 @@ class ALNSPricingEnv:
             improved = False
             base_rc = self.reduced_cost(current)
 
-            # randomize candidate order a bit
+            # randomize candidate order
             self.random.shuffle(remaining)
 
             for trip in remaining[:]:
@@ -562,26 +580,132 @@ class ALNSPricingEnv:
                     break
 
         return current
+    
+    def repair_best_insertion(self, partial_block: List[int]) -> List[int]:
+        "Repair a partial block by repeatedly choosing best feasible insertion among all possibilities"
+        candidates = self.candidate_trips()
+        current = partial_block.copy()
+        remaining = [t for t in candidates if t not in current]
 
+        if not current and remaining:
+            best_single = min(remaining, key=lambda t: self.reduced_cost([t]))
+            current = [best_single]
+            remaining.remove(best_single)
+
+        improved = True
+        while improved:
+            improved = False
+            base_rc = self.reduced_cost(current)
+
+            best_trip = None
+            best_pos = None
+            best_rc = base_rc
+
+            for trip in remaining:
+                for pos in range(len(current) + 1):
+                    cand = current[:pos] + [trip] + current[pos:]
+                    if not self.is_feasible(cand):
+                        continue
+
+                    cand_rc = self.reduced_cost(cand)
+                    if cand_rc < best_rc:
+                        best_rc = cand_rc
+                        best_trip = trip
+                        best_pos = pos
+
+            if best_trip is not None:
+                current = current[:best_pos] + [best_trip] + current[best_pos:]
+                remaining.remove(best_trip)
+                improved = True
+
+        return current
+    
+    def repair_regret2(self, partial_block: List[int]) -> List[int]:
+        "Repair a partial block using regret-2 insertion, for each trip compare its best and second best insertion cost."
+        "Trips with high regret = second best - best, are inserted first because postponing them would be bad"
+
+        candidates = self.candidate_trips()
+        current = partial_block.copy()
+        remaining = [t for t in candidates if t not in current]
+
+        # If empty, start with best singleton
+        if not current and remaining:
+            best_single = min(remaining, key=lambda t: self.reduced_cost([t]))
+            current = [best_single]
+            remaining.remove(best_single)
+
+        improved = True
+        while improved and remaining:
+            improved = False
+            base_rc = self.reduced_cost(current)
+
+            best_trip = None
+            best_pos = None
+            best_regret = -float("inf")
+            best_new_rc = float("inf")
+
+            for trip in remaining:
+                insertion_values = []
+
+                for pos in range(len(current) + 1):
+                    cand = current[:pos] + [trip] + current[pos:]
+                    if not self.is_feasible(cand):
+                        continue
+
+                    cand_rc = self.reduced_cost(cand)
+                    insertion_values.append((cand_rc, pos))
+
+                if not insertion_values:
+                    continue
+
+                insertion_values.sort(key=lambda x: x[0])
+
+                best_val, best_pos_trip = insertion_values[0]
+                second_val = insertion_values[1][0] if len(insertion_values) > 1 else best_val
+
+                regret = second_val - best_val
+
+                # choose highest regret; break ties by best resulting reduced cost
+                if regret > best_regret or (regret == best_regret and best_val < best_new_rc):
+                    best_regret = regret
+                    best_trip = trip
+                    best_pos = best_pos_trip
+                    best_new_rc = best_val
+
+            if best_trip is not None and best_new_rc < base_rc:
+                current = current[:best_pos] + [best_trip] + current[best_pos:]
+                remaining.remove(best_trip)
+                improved = True
+
+        return current
+    
+    
     def select_operator(self, weights: Dict[str, float]) -> str:
+        "Select a destroy or repair operator using adaptive weights"
         names = list(weights.keys())
         probs = np.array([weights[n] for n in names], dtype=float)
         probs = probs / probs.sum()
+
         return self.random.choices(names, weights=probs, k=1)[0]
 
     def accept(self, s: List[int], s_new: List[int], temperature: float) -> bool:
+        "Acceptance rule for ALNS, using simulated annealing"
+
         rc_s = self.reduced_cost(s)
         rc_new = self.reduced_cost(s_new)
 
         if rc_new < rc_s:
             return True
+        # if new block is worse, accept with some probability to escape local minima
         if temperature <= 1e-12:
             return False
 
         delta = rc_new - rc_s
+
         return self.random.random() < math.exp(-delta / temperature)
 
     def update_scores(self, destroy_name: str, repair_name: str, outcome: str):
+        "Reward operators depending on how good the accepted move was"
         if outcome == "global_best":
             reward = 5.0
         elif outcome == "improved":
@@ -597,6 +721,7 @@ class ALNSPricingEnv:
         self.repair_attempts[repair_name] += 1
 
     def update_weights(self):
+        "Update operator weights using average score over recent attempts"
         lam = self.reaction_factor
 
         for name in self.destroy_ops:
@@ -614,15 +739,17 @@ class ALNSPricingEnv:
                 )
 
     def reset_scores(self):
+        "Reset the ALNS weights after a segment of iterations"
         self.destroy_scores = {k: 0.0 for k in self.destroy_ops}
         self.repair_scores = {k: 0.0 for k in self.repair_ops}
 
     def reset_attempts(self):
+        "Reset the ALNS weights after a segment of iterations"
         self.destroy_attempts = {k: 0 for k in self.destroy_ops}
         self.repair_attempts = {k: 0 for k in self.repair_ops}
 
     def solve(self) -> Tuple[List[int], float]:
-        # Initialization
+        "Run ALNS until max_iter or until a negative reduced costs block is found"
         s = self.initial_solution()
         if not s:
             return [], float("inf")
@@ -632,13 +759,17 @@ class ALNSPricingEnv:
         temperature = 3.0
 
         for it in range(1, self.max_iter + 1):
+            # choose operators
             d_name = self.select_operator(self.destroy_weights)
             r_name = self.select_operator(self.repair_weights)
 
             destroy = self.destroy_ops[d_name]
             repair = self.repair_ops[r_name]
-
+            
+            # apply destroy and repair
             s_new = repair(destroy(s))
+
+            # compute reduced costs
             rc_old = self.reduced_cost(s)
             rc_new = self.reduced_cost(s_new)
 
@@ -660,105 +791,21 @@ class ALNSPricingEnv:
             if best_rc < -1e-3:
                 return s_best, best_rc
 
+            # update the weight every segment
             if it % self.segment_length == 0:
                 self.update_weights()
                 self.reset_scores()
                 self.reset_attempts()
 
+            # decrease the temperature to not less worse solutions over time
             temperature *= 0.99
 
         return s_best, best_rc
 
+def alns_pricing_multi(trips, graph, duals, n_runs=4, max_cols=4):
+    "Run ALNS multiple times with different random seeds, and keeping the best 6 columns"
+    "Every CG iteration produces 4 best columns instead of 1 per iteration."
 
-def alns_pricing(trips, graph, duals):
-    pricer = ALNSPricingEnv(
-        trips_df=trips,
-        graph=graph,
-        duals=duals,
-        block_cost=1000.0,
-        time_cost_per_min=0.1,
-        max_iter=40,
-        candidate_pool_size=30,
-        reaction_factor=0.2,
-        segment_length=10,
-    )
-    return pricer.solve()
-
-def column_signature(block):
-    return tuple(block)
-
-
-def existing_column_signatures(columns):
-    return {tuple(col["trips"]) for col in columns.values()}
-
-def generate_short_columns(trips, graph, duals, max_pairs_per_seed=3, use_triples=False, max_triples_total=200):
-    """
-    Generate promising 2-trip columns, and optionally a limited number of 3-trip columns.
-    Returns list of (block, reduced_cost).
-    """
-    results = []
-    trip_ids = trips.trip_number.tolist()
-
-    def reduced_cost(block):
-        cost = compute_block_cost(block, graph)
-        return cost - sum(duals.get(t, 0.0) for t in block)
-
-    # 2-trip columns
-    for i in trip_ids:
-        succs = graph.get(i, [])
-        scored_pairs = []
-
-        for j, travel_time, slack, distance_km in succs:
-            block = [i, j]
-            rc = reduced_cost(block)
-            if rc < -1e-6:
-                scored_pairs.append((block, rc))
-
-        scored_pairs.sort(key=lambda x: x[1])
-        results.extend(scored_pairs[:max_pairs_per_seed])
-
-    # Optional, heavily capped 3-trip columns
-    if use_triples:
-        triple_count = 0
-        for i in trip_ids:
-            succs_i = graph.get(i, [])
-
-            for j, _, _, _ in succs_i[:max_pairs_per_seed]:
-                succs_j = graph.get(j, [])
-
-                for k, _, _, _ in succs_j[:max_pairs_per_seed]:
-                    if k == i:
-                        continue
-
-                    block = [i, j, k]
-                    rc = reduced_cost(block)
-                    if rc < -1e-6:
-                        results.append((block, rc))
-                        triple_count += 1
-
-                    if triple_count >= max_triples_total:
-                        break
-                if triple_count >= max_triples_total:
-                    break
-            if triple_count >= max_triples_total:
-                break
-
-    # deduplicate
-    best_by_block = {}
-    for block, rc in results:
-        sig = tuple(block)
-        if sig not in best_by_block or rc < best_by_block[sig]:
-            best_by_block[sig] = rc
-
-    final_results = [(list(sig), rc) for sig, rc in best_by_block.items()]
-    final_results.sort(key=lambda x: x[1])
-    return final_results
-
-def alns_pricing_multi(trips, graph, duals, n_runs=8, max_cols=10):
-    """
-    Run lightweight ALNS multiple times with different seeds and collect distinct negative columns.
-    Returns list of (block, reduced_cost).
-    """
     found = {}
 
     for run in range(n_runs):
@@ -766,8 +813,8 @@ def alns_pricing_multi(trips, graph, duals, n_runs=8, max_cols=10):
             trips_df=trips,
             graph=graph,
             duals=duals,
-            block_cost=1000.0,
-            time_cost_per_min=0.1,
+            block_cost=1000.0, # artificially use block cost of 1000 instead of real bus cost to reduce number of buses used
+            cost_per_km=0.13,
             max_iter=20,
             candidate_pool_size=len(trips),
             reaction_factor=0.2,
@@ -787,14 +834,15 @@ def alns_pricing_multi(trips, graph, duals, n_runs=8, max_cols=10):
     return results[:max_cols]
 
 def pricing_multi_columns(trips, graph, duals):
+    "Run ALNS several times, keep full blocks and generate contiguous subcolumns from each block"
     candidates = []
 
-    # use your real trip distance column name here
     trip_km = {row.trip_number: row.distance_km for row in trips.itertuples(index=False)}
 
-    print("  pricing: start ALNS multi")
-    alns_cols = alns_pricing_multi(trips, graph, duals, n_runs=4, max_cols=5)
-    print(f"  pricing: ALNS multi returned {len(alns_cols)} columns")
+    # print("  pricing: start ALNS multi")
+    # keep the 5 best columns
+    alns_cols = alns_pricing_multi(trips, graph, duals)
+    # print(f"  pricing: ALNS multi returned {len(alns_cols)} columns")
 
     for block, rc in alns_cols:
         if not block:
@@ -814,15 +862,11 @@ def pricing_multi_columns(trips, graph, duals):
     results = [(list(sig), rc) for sig, rc in best_by_block.items()]
     results.sort(key=lambda x: x[1])
 
-    print(f"  pricing: total distinct improving columns {len(results)}")
+    # print(f"  pricing: total distinct improving columns {len(results)}")
     return results
 
-def generate_contiguous_subcolumns(block, duals, graph, trip_km, min_len=6):
-    """
-    Generate all contiguous feasible subcolumns from a block.
-    Since the original block is feasible, every contiguous slice is feasible.
-    Returns list of (subblock, reduced_cost).
-    """
+def generate_contiguous_subcolumns(block, duals, graph, trip_km, min_len=2):
+    "Generate all contiguous subcolumns from a block"
     results = []
     n = len(block)
 
@@ -837,3 +881,21 @@ def generate_contiguous_subcolumns(block, duals, graph, trip_km, min_len=6):
 
     return results
 
+def rebuild_columns_with_real_costs(trips, graph, columns, real_fixed_cost=244.13, cost_per_km=0.13):
+    "Rebuild final columns with real fixed costs, instead of 1000"
+    trip_km = {row.trip_number: row.distance_km for row in trips.itertuples(index=False)}
+
+    real_columns = {}
+    for name, col in columns.items():
+        real_columns[name] = {
+            "trips": col["trips"],
+            "cost": compute_block_cost(
+                col["trips"],
+                graph,
+                trip_km,
+                fixed_cost=real_fixed_cost,
+                cost_per_km=cost_per_km
+            )
+        }
+
+    return real_columns
