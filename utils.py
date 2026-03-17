@@ -1,8 +1,5 @@
 from pricing_env import EVSPPricingEnv
-from typing import Dict, List, Tuple, Any
 import pandas as pd
-import numpy as np
-import random
 import pulp
 
 # build deadhead dictionary
@@ -125,27 +122,23 @@ def build_trip_graph_from_arcs_df(trips: pd.DataFrame, arcs_df: pd.DataFrame):
 
 
 # Column Generation Part
-def compute_block_cost(block, graph, fixed_cost=1000.0, time_cost_per_min = 0.001):
-    if len(block) <= 1:
-        return fixed_cost
-    
-    total_time_cost = 0.0
-    for k in range(len(block)-1):
-        i_trip, j_trip = block[k], block[k+1]
+def compute_block_cost(block, graph, trips_df, bus_params):
+    trip_distance = sum(trips_df[trips_df['trip_number'].isin(block)]['distance_km'].tolist())
+    deadhead_distance = 0.0
+    for k in range(len(block) - 1):
+        arc = next((a for a in graph.get(block[k], []) if a[0] == block[k+1]), None)
+        if arc:
+            deadhead_distance += arc[3]
         
-        # Find arc (i_trip → j_trip) in graph[i_trip]
-        arc_found = False
-        for candidate_trip, travel_time, slack, distance in graph.get(i_trip, []):
-            if candidate_trip == j_trip:
-                total_time_cost += (travel_time + slack) * time_cost_per_min
-                arc_found = True
-                break
-        
-        # If no explicit arc (same-stop connection), assume zero cost
-        if not arc_found:
-            total_time_cost += 0.0  # or some default cost
+    total_distance = trip_distance + deadhead_distance
+    total_energy = total_distance * bus_params.energy_per_km
+    battery_pct = min(total_energy / bus_params.battery_capacity_kwh, 1.0)
     
-    return fixed_cost + total_time_cost
+    return (
+        bus_params.fixed_cost
+        + total_distance * bus_params.cost_per_km
+        + battery_pct * bus_params.full_recharge_cost
+    )
 
 def init_columns(trips):
     cols = {}
@@ -174,10 +167,7 @@ def solve_master(trips, columns):
     print(f"Dual range: {min(duals.values()):.3f}-{max(duals.values()):.3f}")
     return model, duals
 
-
-
-
-def col_gen_step(trips, graph, columns, arcs_df, policy_net, optimizer, sub_problem='rl', stats=None):
+def col_gen_step(trips, graph, columns, arcs_df, policy_net, optimizer, bus_params, stats=None):
     from agent import rl_pricing
     from pricing_env import greedy_pi_policy
     
@@ -217,7 +207,7 @@ def col_gen_step(trips, graph, columns, arcs_df, policy_net, optimizer, sub_prob
         print("No improvement found!")
         return False, model, columns
 
-    block_cost = compute_block_cost(block, graph)
+    block_cost = compute_block_cost(block, graph, trips, bus_params)
     col_name = f"col_{len(columns)}"
     columns[col_name] = {"trips": block, "cost": block_cost}
     print(f"Greedy RC: {greedy_rc:.3f} | RL RC: {rl_rc:.3f} | Gap: {rl_rc - greedy_rc:.3f}")
