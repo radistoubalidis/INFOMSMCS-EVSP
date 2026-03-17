@@ -3,3 +3,7 @@
 requirements.txt
 evsp-instances
 __pycache__
+policy_ckeckpoint.pt
+debug_policy_ckeckpoint.pt
+*.log
+run_rl.sh
