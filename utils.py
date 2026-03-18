@@ -820,6 +820,7 @@ def alns_pricing_multi(trips, graph, duals, n_runs=4, max_cols=4):
             reaction_factor=0.2,
             segment_length=10,
             seed=42 + run,
+            # seed = random.randint(0,10**6),
         )
 
         block, rc = pricer.solve()
