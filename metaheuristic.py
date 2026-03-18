@@ -1,9 +1,8 @@
 from combine_data import parse_dhd, parse_parameters, parse_trips
-from utils import feasible_arcs, build_deadhead_dict,init_columns, build_trip_graph_from_arcs_df, col_gen_step, solve_final_integer_master, rebuild_columns_with_real_costs
+from utils import feasible_arcs, build_deadhead_dict,init_columns, build_trip_graph_from_arcs_df, col_gen_step, solve_final_integer_master, rebuild_columns_with_real_costs, build_depot_energy_lookup
 import pandas as pd
 import pulp
 import copy
-
 
 def main():
     UTR_trips = 'utr/trips.txt'
@@ -18,10 +17,17 @@ def main():
     # dhd = pd.read_csv('combined_datasets/dhd.csv')
 
     deadheads = build_deadhead_dict(dhd)
-    arcs = feasible_arcs(trips, deadheads, depot_stop = "nwggar")
+    arcs = feasible_arcs(trips, deadheads, depot_stop = "utrgar")
     arcs_df = pd.DataFrame(arcs)
+    pull_out_energy, pull_in_energy = build_depot_energy_lookup(arcs_df)
     graph = build_trip_graph_from_arcs_df(trips, arcs_df)
     columns = init_columns(trips)
+    battery_capacity = 190
+
+    trip_energy = {
+        row.trip_number: row.distance_km * 1.3
+        for row in trips.itertuples(index=False)
+    }
 
     max_iters = 20
 
@@ -29,7 +35,12 @@ def main():
 
     for i in range(max_iters):
  
-        improved, model, columns = col_gen_step(trips=trips, graph=graph, columns=columns, sub_problem="metaheuristics")
+        improved, model, columns = col_gen_step(trips=trips, graph=graph, columns=columns, sub_problem="metaheuristics",
+        trip_energy=trip_energy,
+        pull_out_energy=pull_out_energy,
+        pull_in_energy=pull_in_energy,
+        battery_capacity=battery_capacity
+    )
 
         if not improved:
             print("No improving column found.")
