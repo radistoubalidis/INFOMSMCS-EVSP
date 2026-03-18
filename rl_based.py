@@ -10,6 +10,10 @@ from agent import save_policy, load_policy, get_env_dummy
 from dataclasses import dataclass
 import pandas as pd
 import pulp
+import os
+import datetime
+import json
+
 print("Script started")
     
 def solve_final_integer_master(trips, columns):
@@ -19,10 +23,10 @@ def solve_final_integer_master(trips, columns):
 
     trip_ids = trips.trip_number.unique().tolist()  # FIXED: added .unique()
     for t in trip_ids:
-        model += pulp.lpSum(x[name] for name, col in columns.items() if t in col["trips"]) == 1, f"cover_{t}"
+        model += pulp.lpSum(x[name] for name, col in columns.items() if t in col["trips"]) >= 1, f"cover_{t}"
 
     model.solve(pulp.PULP_CBC_CMD(msg=False))
-    return model
+    return model, {name: pulp.value(x[name]) for name in columns}
 
 
 
@@ -50,6 +54,19 @@ class BusParams:
             max_charge_rate_kwh_min=row['max_charge_rate_kwh/min'],
         )
 
+def save_viz_data(buses: list[float], costs: list[float], total_cost: float):    
+    viz_data_path = f'viz_data/viz_data_{datetime.datetime.now().strftime("%Y-%m-%d-%H:%M:%S")}.json'
+    
+    viz_data = {'steps': [], 'total_cost': total_cost}
+    for i in range(len(buses)):
+        viz_data['steps'].append({
+            'step': i,
+            'buses': buses[i],
+            'cost': costs[i]
+        })
+        
+    with open(viz_data_path, 'w') as f:
+        json.dump(viz_data, f, indent=4)
 
 def main():
     DEBUG = False
@@ -82,26 +99,32 @@ def main():
 
     policy_net, optimizer, stats = load_policy(state_dim, n_actions, filepath=save_policy_to)
     
+    
+    var_costs = []
+    var_buses = []
     for i in range(max_iter):
         improved, model, columns = col_gen_step(
             trips, graph, columns, arcs_df,bus_params=bus_params,
             policy_net=policy_net, optimizer=optimizer, stats=stats
         )
+        var_costs.append(pulp.value(model.objective))
+        var_buses.append(sum(1 for var in model.variablesDict().values() if var.varValue > 0.5))
         
         if i % 5 == 0:
             save_policy(policy_net, optimizer, stats, filepath=save_policy_to)
-        
+
         if not improved:
             break
     
     save_policy(policy_net, optimizer, stats, filepath=save_policy_to)
 
-    final_model = solve_final_integer_master(trips, columns)
+    final_model, selected = solve_final_integer_master(trips, columns)
     print(f"Total number of trips to service: {len(trips['trip_number'].tolist())}")
-    n_buses = sum(1 for var in final_model.variablesDict().values() if var.varValue > 0.5)
+    n_buses = [name for name, val in selected.items() if val and val > 0.5]
     total_cost = pulp.value(final_model.objective)
     print(f"Total cost: €{total_cost:.2f}")
-    print(f"Buses needed: {n_buses}")
+    print(f"Buses needed: {len(n_buses)}")
+    save_viz_data(var_buses, var_costs, total_cost)
 
 if __name__ == '__main__':
     main()

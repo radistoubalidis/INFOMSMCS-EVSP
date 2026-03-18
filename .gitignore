@@ -7,3 +7,4 @@ policy_ckeckpoint.pt
 debug_policy_ckeckpoint.pt
 *.log
 run_rl.sh
+viz_data

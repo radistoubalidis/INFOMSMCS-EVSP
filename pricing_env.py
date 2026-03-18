@@ -7,14 +7,14 @@ from typing import Dict, List, Tuple, Any
 class EVSPPricingEnv:
     def __init__(self, trips_df: pd.DataFrame, graph: Dict[int, List[int]],duals: Dict[int, float],
                  pull_out_trips: List[int],
-                 block_cost: float = 244.13, time_cost_per_min: float = 0.1, max_len: int = 30, bus_params=None
+                 block_cost: float = 244.13, cost_per_km: float = 0.13, max_len: int = 30, bus_params=None
     ):
         self.trips = trips_df.set_index('trip_number')
         self.graph = graph
         self.duals = duals
         self.pull_out_trips = pull_out_trips
         self.block_cost = block_cost
-        self.time_cost_per_min = time_cost_per_min
+        self.cost_per_km = cost_per_km
         self.max_len = max_len
         self.all_trips = sorted(list(graph.keys()))
         self.trip_to_idx = {t: i for i, t in enumerate(self.all_trips)}
@@ -82,17 +82,18 @@ class EVSPPricingEnv:
             travel_time, slack = 0, 0
 
         if self.current_trip is not None:
-            arc_cost = (travel_time + slack) * self.time_cost_per_min
+            dead_km = action[3]
+            arc_cost = dead_km * self.cost_per_km
             self.cumulative_time_cost += arc_cost
 
         self.current_trip = (trip_num,)
         self.block.append(trip_num)
         if self.bus_params:
-            dead_km = action[3] if isinstance(action, tuple) and len(action) > 3 else 0.0
             try:
                 trip_dist = self.trips.loc[trip_num]['distance_km'].tolist()[0]
             except:
                 trip_dist = self.trips.loc[trip_num]['distance_km']
+            dead_km = action[3]
             self.remaining_battery -= (dead_km + trip_dist) * self.bus_params.energy_per_km
         self.cumulative_pi += self.duals[trip_num]
 
@@ -117,9 +118,8 @@ def random_policy(env):
 
 
 def score_action(env, action):
-    return env.duals[action[0]] \
-        - env.time_cost_per_min * action[1] \
-        - env.time_cost_per_min * action[2]
+    dead_km = action[3]
+    return env.duals[action[0]] - env.cost_per_km * dead_km
 
 
 def greedy_pi_policy(env):

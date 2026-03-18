@@ -203,7 +203,15 @@ def col_gen_step(trips, graph, columns, arcs_df, policy_net, optimizer, bus_para
         (row.to_stop, row.travel_time, 0, row.distance_km) 
         for row in arcs_df[arcs_df['arc_type'] == 'pull_out'].itertuples()
     ]
-    env = EVSPPricingEnv(trips_df=trips, graph=graph, duals=duals, pull_out_trips=pull_out_trips, block_cost=244.13, bus_params=bus_params)
+    env = EVSPPricingEnv(
+        trips_df=trips, 
+        graph=graph, 
+        duals=duals, 
+        pull_out_trips=pull_out_trips, 
+        cost_per_km=bus_params.cost_per_km, 
+        block_cost=244.13, 
+        bus_params=bus_params
+    )
 
     greedy_block, greedy_rc = greedy_pi_policy(env)
     env.reset()
