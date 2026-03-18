@@ -7,7 +7,7 @@ from typing import Dict, List, Tuple, Any
 class EVSPPricingEnv:
     def __init__(self, trips_df: pd.DataFrame, graph: Dict[int, List[int]],duals: Dict[int, float],
                  pull_out_trips: List[int],
-                 block_cost: float = 244.13, time_cost_per_min: float = 0.1, max_len: int = 30
+                 block_cost: float = 244.13, time_cost_per_min: float = 0.1, max_len: int = 30, bus_params=None
     ):
         self.trips = trips_df.set_index('trip_number')
         self.graph = graph
@@ -19,6 +19,7 @@ class EVSPPricingEnv:
         self.all_trips = sorted(list(graph.keys()))
         self.trip_to_idx = {t: i for i, t in enumerate(self.all_trips)}
         self.n_trips = len(self.all_trips)
+        self.bus_params = bus_params
         self.reset()
 
     def reset(self):
@@ -28,6 +29,7 @@ class EVSPPricingEnv:
         self.steps = 0
         self.cumulative_pi = 0.0
         self.cumulative_time_cost = 0.0
+        self.remaining_battery = self.bus_params.battery_capacity_kwh if self.bus_params else float('inf')
         return self._get_state()
 
     def _get_state(self):
@@ -38,7 +40,21 @@ class EVSPPricingEnv:
         if self.current_trip is None:
             return self.pull_out_trips
         else:
-            return list(self.graph[self.current_trip[0]])
+            actions = list(self.graph[self.current_trip[0]])
+            if self.bus_params is None:
+                return actions
+            feasible = []
+            for arc in actions:
+                trip_num = arc[0]
+                dead_km = arc[3] if len(arc) > 3 else 0.0
+                try:
+                    trip_dist = self.trips.loc[trip_num]['distance_km'].tolist()[0]
+                except:
+                    trip_dist = self.trips.loc[trip_num]['distance_km']
+                energy_needed = (dead_km + trip_dist) * self.bus_params.energy_per_km
+                if energy_needed <= self.remaining_battery:
+                    feasible.append(arc)
+            return feasible
 
     def step(self, action: Any):
         self.steps += 1
@@ -71,6 +87,13 @@ class EVSPPricingEnv:
 
         self.current_trip = (trip_num,)
         self.block.append(trip_num)
+        if self.bus_params:
+            dead_km = action[3] if isinstance(action, tuple) and len(action) > 3 else 0.0
+            try:
+                trip_dist = self.trips.loc[trip_num]['distance_km'].tolist()[0]
+            except:
+                trip_dist = self.trips.loc[trip_num]['distance_km']
+            self.remaining_battery -= (dead_km + trip_dist) * self.bus_params.energy_per_km
         self.cumulative_pi += self.duals[trip_num]
 
         reward = 0.0

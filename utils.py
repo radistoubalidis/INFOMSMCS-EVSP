@@ -122,6 +122,30 @@ def build_trip_graph_from_arcs_df(trips: pd.DataFrame, arcs_df: pd.DataFrame):
 
 
 # Column Generation Part
+def is_battery_feasible(block, graph, trips_df, arcs_df, bus_params):
+    trips_indexed = trips_df.drop_duplicates('trip_number').set_index('trip_number')
+    battery = bus_params.battery_capacity_kwh
+
+    if arcs_df is not None and len(block) > 0:
+        first_trip = block[0]
+        pull_out_row = arcs_df[(arcs_df['arc_type'] == 'pull_out') & 
+                                (arcs_df['to_stop'] == first_trip)]
+        if not pull_out_row.empty:
+            battery -= pull_out_row.iloc[0]['distance_km'] * bus_params.energy_per_km
+
+    for k, trip in enumerate(block):
+        trip_dist = trips_indexed.loc[trip, 'distance_km'] if trip in trips_indexed.index else 0.0
+        battery -= trip_dist * bus_params.energy_per_km
+        if battery < 0:
+            return False
+        if k < len(block) - 1:
+            arc = next((a for a in graph.get(trip, []) if a[0] == block[k+1]), None)
+            if arc:
+                battery -= arc[3] * bus_params.energy_per_km
+            if battery < 0:
+                return False
+    return True
+
 def compute_block_cost(block, graph, trips_df, bus_params):
     trip_distance = sum(trips_df[trips_df['trip_number'].isin(block)]['distance_km'].tolist())
     deadhead_distance = 0.0
@@ -176,10 +200,10 @@ def col_gen_step(trips, graph, columns, arcs_df, policy_net, optimizer, bus_para
 
     pull_out_trips = arcs_df[arcs_df['arc_type'] == 'pull_out']['to_stop'].tolist()
     pull_out_trips = [
-        (row.to_stop, row.travel_time, 0, row.distance_km)  # slack=0 for pull_out
+        (row.to_stop, row.travel_time, 0, row.distance_km) 
         for row in arcs_df[arcs_df['arc_type'] == 'pull_out'].itertuples()
     ]
-    env = EVSPPricingEnv(trips_df=trips, graph=graph, duals=duals, pull_out_trips=pull_out_trips, block_cost=244.13)
+    env = EVSPPricingEnv(trips_df=trips, graph=graph, duals=duals, pull_out_trips=pull_out_trips, block_cost=244.13, bus_params=bus_params)
 
     greedy_block, greedy_rc = greedy_pi_policy(env)
     env.reset()
@@ -205,6 +229,10 @@ def col_gen_step(trips, graph, columns, arcs_df, policy_net, optimizer, bus_para
 
     if reduced_cost >= -1e-3:
         print("No improvement found!")
+        return False, model, columns
+    
+    if not is_battery_feasible(block, graph, trips, arcs_df, bus_params):
+        print("Block rejected: battery infeasible")
         return False, model, columns
 
     block_cost = compute_block_cost(block, graph, trips, bus_params)
