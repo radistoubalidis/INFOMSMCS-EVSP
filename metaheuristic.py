@@ -68,6 +68,7 @@ def main():
     print(f"Buses used: {bus_count}")
     print(f"Total cost: {cost:.2f}")
     
+    print("Unique trip_number values:", trips["trip_number"].nunique())
             
 if __name__ == '__main__':
     main()
