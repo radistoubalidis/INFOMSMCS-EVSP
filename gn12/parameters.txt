@@ -1,0 +1,13 @@
+P;15;0.5;75;240;4;0.0;1;0.1
+S;c:\optibus\gn20\stats_elec.txt
+I;c:\optibus\ini\optibus_prodcg.ini
+V;E18G;g
+@VDL Geleed HUIDG lijn 1/2 Qlink Groen
+U;g;244.13;0;0.13;0;0;0;J;2.25;4.5;0;144.0
+G;gngstr
+L;gngstr;*;0
+E;gngstr;99;1;2.5;1.0
+@Lijn 1 en 2
+E;zhnsta;99;2;4.5;.97
+E;gngprr;99;2;4.5;.97
+
