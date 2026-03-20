@@ -1,5 +1,5 @@
 from combine_data import parse_dhd, parse_parameters, parse_trips
-from utils import feasible_arcs, build_deadhead_dict,init_columns, build_trip_graph_from_arcs_df, col_gen_step, solve_final_integer_master, prune_columns_for_final_solve, BusParams
+from utils import feasible_arcs, build_deadhead_dict,init_columns, build_trip_graph_from_arcs_df, col_gen_step, solve_final_integer_master, BusParams
 import pandas as pd
 import pulp
 from time import perf_counter
@@ -62,12 +62,12 @@ def compute_solution_times(final_model, columns, graph, trip_time):
         "total_time": total_operational_time,
     }
 
-def save_viz_data(buses: list[float], costs: list[float], total_cost: float, dataset, max_iters):
+def save_viz_data(buses: list[float], costs: list[float], total_cost: float, dataset, max_iters, total_buses:int , runtime: float):
     os.makedirs("viz_data", exist_ok=True)
 
-    viz_data_path = f'viz_data/{dataset}_iters{max_iters}_{datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")}.json'
+    viz_data_path = f'viz_data/metaheuristic_{dataset}_iters{max_iters}_{datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")}.json'
     
-    viz_data = {'steps': [], 'total_cost': total_cost}
+    viz_data = {'steps': [], 'total_cost': total_cost, 'total_buses': total_buses, 'runtime': runtime}
     
     for i in range(len(buses)):
         viz_data['steps'].append({
@@ -84,7 +84,7 @@ def save_viz_data(buses: list[float], costs: list[float], total_cost: float, dat
 def main():
     start = perf_counter()
 
-    dataset = "utr"
+    dataset = "qlink_3,7,8"
 
     UTR_trips = f'{dataset}/trips.txt'
     trips = parse_trips(UTR_trips)
@@ -95,14 +95,14 @@ def main():
     bus_params = BusParams.from_params_df(params)
 
     deadheads = build_deadhead_dict(dhd)
-    arcs = feasible_arcs(trips, deadheads, depot_stop = "utrgar")
+    arcs = feasible_arcs(trips, deadheads, depot_stop = "nwggar")
     arcs_df = pd.DataFrame(arcs)
     pull_out_energy, pull_in_energy = build_depot_energy_lookup(arcs_df, bus_params.energy_per_km)
     graph = build_trip_graph_from_arcs_df(trips, arcs_df)
     columns = init_columns(trips, bus_params.fixed_cost)
 
 
-    max_iters = 100
+    max_iters = 1000
 
     print(f"\nStarting column generation with {max_iters} iterations")
 
@@ -133,18 +133,12 @@ def main():
 
     print(f"Total columns generated: {len(columns)}")
 
-    print(f"Columns before pruning: {len(columns)}")
-
-    columns = prune_columns_for_final_solve(columns, max_non_singletons=600)
-
-    print(f"Columns after pruning: {len(columns)}")
-
 
     # solve final master directly on columns
     final_model = solve_final_integer_master(
         trips,
         columns,
-        time_limit=60,
+        time_limit=300,
         msg=True
     )
 
@@ -158,13 +152,6 @@ def main():
     # total cost
     cost = pulp.value(final_model.objective)
 
-    # save_viz_data(
-    #     buses=buses_history,
-    #     costs=costs_history,
-    #     total_cost=cost,
-    #     dataset=dataset,
-    #     max_iters=max_iters
-    # )
 
 
     # print selected columns
@@ -190,9 +177,20 @@ def main():
     print(f"Buses used: {bus_count}")
     print(f"Total cost: {cost:.2f}")
     # print("Unique trip numbers:", trips["trip_number"].nunique())
-    print(f"CPU Time: {perf_counter() - start:.4f} seconds")
-    print(bus_params.battery_capacity_kwh)
-    print(bus_params.energy_per_km)
+
+    running_time = perf_counter() - start
+
+    print(f"CPU Time: {running_time:.4f} seconds")
+
+    save_viz_data(
+        buses=buses_history,
+        costs=costs_history,
+        total_cost=cost,
+        dataset=dataset,
+        max_iters=max_iters,
+        total_buses=bus_count,
+        runtime=running_time
+    )
 
 
 if __name__ == '__main__':

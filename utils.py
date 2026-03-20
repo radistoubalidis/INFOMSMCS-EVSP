@@ -264,17 +264,17 @@ def col_gen_step(trips, graph, columns, pull_out_energy, pull_in_energy, bus_par
         candidate_blocks.append((main_block, main_rc))
 
         # add subcolumns from that one block
-        # sub_cols = generate_contiguous_subcolumns(
-        #     main_block,
-        #     duals,
-        #     graph,
-        #     trip_km,
-        #     bus_params,
-        #     pull_out_energy,
-        #     pull_in_energy,
-        #     min_len=4
-        # )
-        # candidate_blocks.extend(sub_cols)
+        sub_cols = generate_contiguous_subcolumns(
+            main_block,
+            duals,
+            graph,
+            trip_km,
+            bus_params,
+            pull_out_energy,
+            pull_in_energy,
+            min_len=4
+        )
+        candidate_blocks.extend(sub_cols)
 
     if not candidate_blocks:
         print("No improvement found!")
@@ -827,29 +827,6 @@ def generate_contiguous_subcolumns(block, duals, graph, trip_km, bus_params, pul
                 results.append((sub, rc))
 
     return results
-
-
-def prune_columns_for_final_solve(columns, max_non_singletons=600):
-    "Prune columns before solving final master to reduce running time"
-    "Keeps als singleton blocks, and most promising blocks with longer columns and longer cost"
-
-    singleton_cols = {}
-    non_singleton_cols = []
-
-    for name, col in columns.items():
-        if len(col["trips"]) == 1:
-            singleton_cols[name] = col
-        else:
-            non_singleton_cols.append((name, col))
-
-    non_singleton_cols.sort(key=lambda x: (-len(x[1]["trips"]), x[1]["cost"]))
-    kept_non_singletons = non_singleton_cols[:max_non_singletons]
-
-    pruned = dict(singleton_cols)
-    for name, col in kept_non_singletons:
-        pruned[name] = col
-
-    return pruned
 
 def alns_pricing(trips, graph, duals, pull_out_energy, pull_in_energy, bus_params):
     "Run one ALNS pricing solve and return one improving block."
