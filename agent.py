@@ -130,7 +130,8 @@ def save_policy(policy_net, optimizer, stats, filepath="policy_checkpoint.pt"):
 
 def load_policy(state_dim, n_actions, hidden_dim=256, filepath="policy_checkpoint.pt", device="cpu"):
     if os.path.exists(filepath):
-        checkpoint = torch.load(filepath, map_location=device)
+        torch.serialization.add_safe_globals([np._core.multiarray.scalar])
+        checkpoint = torch.load(filepath, map_location=device, weights_only=False)
         policy_net = PolicyNet(state_dim, n_actions, hidden_dim)
         pretrained_dict = checkpoint['policy_state_dict']
         model_dict = policy_net.state_dict()

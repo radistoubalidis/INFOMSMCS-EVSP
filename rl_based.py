@@ -8,6 +8,7 @@ from utils import (
 )
 from agent import save_policy, load_policy, get_env_dummy
 from dataclasses import dataclass
+from time import perf_counter
 import pandas as pd
 import pulp
 import os
@@ -23,9 +24,10 @@ def solve_final_integer_master(trips, columns):
 
     trip_ids = trips.trip_number.unique().tolist()  # FIXED: added .unique()
     for t in trip_ids:
-        model += pulp.lpSum(x[name] for name, col in columns.items() if t in col["trips"]) >= 1, f"cover_{t}"
+        model += pulp.lpSum(x[name] for name, col in columns.items() if t in col["trips"]) == 1, f"cover_{t}"
 
-    model.solve(pulp.PULP_CBC_CMD(msg=False))
+    solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=60)
+    model.solve(solver)
     return model, {name: pulp.value(x[name]) for name in columns}
 
 
@@ -54,10 +56,10 @@ class BusParams:
             max_charge_rate_kwh_min=row['max_charge_rate_kwh/min'],
         )
 
-def save_viz_data(buses: list[float], costs: list[float], total_cost: float):    
-    viz_data_path = f'viz_data/viz_data_{datetime.datetime.now().strftime("%Y-%m-%d-%H:%M:%S")}.json'
+def save_viz_data(buses: list[float], costs: list[float], total_cost: float, total_buses: int, dataset_name: str, runtime: float):    
+    viz_data_path = f'viz_data/{dataset_name}_{datetime.datetime.now().strftime("%Y-%m-%d-%H:%M:%S")}.json'
     
-    viz_data = {'steps': [], 'total_cost': total_cost}
+    viz_data = {'steps': [], 'total_cost': total_cost, 'total_buses': total_buses, 'runtime': runtime}
     for i in range(len(buses)):
         viz_data['steps'].append({
             'step': i,
@@ -69,30 +71,23 @@ def save_viz_data(buses: list[float], costs: list[float], total_cost: float):
         json.dump(viz_data, f, indent=4)
 
 def main():
-    DEBUG = False
-    if DEBUG:
-        UTR_trips = 'utr/trips.txt'
-        trips = parse_trips(UTR_trips)
-        UTR_dhd = 'utr/dhd.txt'
-        dhd = parse_dhd(UTR_dhd)
-        UTR_params = 'utr/parameters.txt'
-        params = parse_parameters(UTR_params)
-        bus_params = BusParams.from_params_df(params)
-        save_policy_to = 'debug_policy_ckeckpoint.pt'
-    else:
-        trips = pd.read_csv('combined_datasets/trips.csv')
-        trips['trip_number'] = trips['line_number'].astype(str) + '_' + trips['trip_number'].astype(str)
-        dhd = pd.read_csv('combined_datasets/dhd.csv')
-        params = pd.read_csv('combined_datasets/parameters.csv')
-        bus_params = BusParams.from_params_df(params)
-        save_policy_to = 'policy_ckeckpoint.pt'
+    dataset_name = "qlink_3,7,8"
+    start = perf_counter()
+    UTR_trips = f'{dataset_name}/trips.txt'
+    trips = parse_trips(UTR_trips)
+    UTR_dhd = f'{dataset_name}/dhd.txt'
+    dhd = parse_dhd(UTR_dhd)
+    UTR_params = f'{dataset_name}/parameters.txt'
+    params = parse_parameters(UTR_params)
+    bus_params = BusParams.from_params_df(params)
+    save_policy_to = f'{dataset_name}_ckeckpoint.pt'
     
     deadheads = build_deadhead_dict(dhd)
-    arcs = feasible_arcs(trips, deadheads, depot_stop = "utrgar", max_wait = 1000)
+    arcs = feasible_arcs(trips, deadheads, depot_stop = "nwggar", max_wait = 240)
     arcs_df = pd.DataFrame(arcs)
     graph = build_trip_graph_from_arcs_df(trips, arcs_df)
     columns = init_columns(trips)
-    max_iter = 100
+    max_iter = 500
     
     _, state_dim, n_actions = get_env_dummy(trips, graph, arcs_df)
     pull_out = arcs_df[arcs_df['arc_type'] == 'pull_out']['to_stop'].unique()
@@ -124,7 +119,9 @@ def main():
     total_cost = pulp.value(final_model.objective)
     print(f"Total cost: €{total_cost:.2f}")
     print(f"Buses needed: {len(n_buses)}")
-    save_viz_data(var_buses, var_costs, total_cost)
+    runtime = perf_counter() - start
+    print(f"Total CPU time:{runtime:.4f} seconds.")
+    save_viz_data(var_buses, var_costs, total_cost, len(n_buses), dataset_name, runtime)
 
 if __name__ == '__main__':
     main()
