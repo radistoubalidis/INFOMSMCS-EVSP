@@ -1,11 +1,37 @@
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple
 import pandas as pd
 import numpy as np
 import random
 import pulp
 import math
+from dataclasses import dataclass
 
-def solve_final_integer_master(trips, columns):
+
+@dataclass
+class BusParams:
+    fixed_cost: float = 244.13
+    cost_per_km: float = 0.13
+    battery_capacity_kwh: float = 160.0
+    energy_per_km: float = 1.9
+    max_charge_rate_kwh_min: float = 7.5
+    electricity_price: float = 0.20
+
+    @property
+    def full_recharge_cost(self):
+        return self.battery_capacity_kwh * self.electricity_price
+
+    @classmethod
+    def from_params_df(cls, params_df):
+        row = params_df.mode().iloc[0]  # most common values
+        return cls(
+            fixed_cost=row['cost_per_bus'],
+            cost_per_km=row['cost_per_km'],
+            battery_capacity_kwh=row['battery_capacity_kwh'],
+            energy_per_km=row['energy_compsumtion_kwh/km'],
+            max_charge_rate_kwh_min=row['max_charge_rate_kwh/min'],
+        )
+    
+def solve_final_integer_master(trips, columns, time_limit=60, msg=False):
     model = pulp.LpProblem("FinalMaster", pulp.LpMinimize)
     x = {name: pulp.LpVariable(name, cat="Binary") for name in columns}
 
@@ -13,8 +39,12 @@ def solve_final_integer_master(trips, columns):
 
     trip_ids = trips.trip_number.drop_duplicates().tolist()
     for t in trip_ids:
-        model += pulp.lpSum(x[name] for name, col in columns.items() if t in col["trips"]) == 1, f"cover_{t}"
-    model.solve(pulp.PULP_CBC_CMD(msg=False))
+        model += pulp.lpSum(
+            x[name] for name, col in columns.items() if t in col["trips"]
+        ) == 1, f"cover_{t}"
+
+    solver = pulp.PULP_CBC_CMD(msg=msg, timeLimit=time_limit)
+    model.solve(solver)
     return model
 
 # build deadhead dictionary
@@ -149,49 +179,48 @@ def build_arc_lookup_from_graph(graph):
     return arc_lookup
 
 
-
 # Column Generation Part
-def compute_block_cost(block, graph, trip_km, fixed_cost=1000.0, cost_per_km=0.13):
+def compute_block_cost(block, graph, trip_km, bus_params, pull_out_energy=None, pull_in_energy=None):
+    "Compute cost of one block"
+
     if len(block) == 0:
         return 0.0
-    if len(block) == 1:
-        return fixed_cost
 
-    arc_lookup = build_arc_lookup_from_graph(graph)
+    trip_distance = sum(trip_km[t] for t in block)
 
-    total_km = 0.0
-
-    # add service trip km
-    for t in block:
-        total_km += trip_km[t]
-
-        # add deadhead km between consecutive trips
+    deadhead_distance = 0.0
     for k in range(len(block) - 1):
-        i, j = block[k], block[k + 1]
-        if (i, j) not in arc_lookup:
+        arc = next((a for a in graph.get(block[k], []) if a[0] == block[k + 1]), None)
+        if arc is None:
             return float("inf")
-        total_km += arc_lookup[(i, j)]["distance_km"]
+        deadhead_distance += arc[3]
 
-    return fixed_cost + cost_per_km * total_km
+    # depot pull-out / pull-in energy in kWh
+    pull_out_kwh = 0.0 if pull_out_energy is None else pull_out_energy.get(block[0], 0.0)
+    pull_in_kwh = 0.0 if pull_in_energy is None else pull_in_energy.get(block[-1], 0.0)
 
-    # for k in range(len(block) - 1):
-    #     i, j = block[k], block[k + 1]
-    #     if (i, j) not in arc_lookup:
-    #         return float("inf")
+    # convert depot energy back to distance-equivalent for km cost
+    pull_out_distance = pull_out_kwh / bus_params.energy_per_km
+    pull_in_distance = pull_in_kwh / bus_params.energy_per_km
 
-    #     travel_time = arc_lookup[(i, j)]["travel_time"]
-    #     slack = arc_lookup[(i, j)]["slack"]
-    #     total_time_cost += (travel_time + slack) * time_cost_per_min
+    # total distance includes depot travel
+    total_distance = trip_distance + deadhead_distance + pull_out_distance + pull_in_distance
 
+    total_energy = total_distance * bus_params.energy_per_km
 
-    # return fixed_cost + total_time_cost
+    battery_pct = min(total_energy / bus_params.battery_capacity_kwh, 1.0)
 
-def init_columns(trips):
+    return (
+        bus_params.fixed_cost
+        + total_distance * bus_params.cost_per_km
+        + battery_pct * bus_params.full_recharge_cost
+    )
+def init_columns(trips, fixed_cost):
     cols = {}
     for t in trips.trip_number:
         cols[f"col_{t}"] = {
             "trips": [t],
-            "cost": 244.13
+            "cost": fixed_cost
         }
     return cols
 
@@ -210,39 +239,64 @@ def solve_master(trips, columns):
     return model, duals
 
 
-def col_gen_step(trips, graph, columns, sub_problem, trip_energy, pull_out_energy, pull_in_energy, battery_capacity):
+def col_gen_step(trips, graph, columns, pull_out_energy, pull_in_energy, bus_params):
     model, duals = solve_master(trips, columns)
     current_objective = pulp.value(model.objective)
 
     trip_km = {row.trip_number: row.distance_km for row in trips.itertuples(index=False)}
 
-    if sub_problem == "rl":
-        env = EVSPPricingEnv(trips_df=trips, graph=graph, duals=duals)
-        block, reduced_cost = greedy_pi_policy(env)
-        new_blocks = [(block, reduced_cost)] if block and reduced_cost < -1e-3 else []
+    candidate_blocks = []
+    main_block = []
+    main_rc = float("inf")
 
-    elif sub_problem == "metaheuristics":
-        new_blocks = pricing_multi_columns( trips=trips, graph=graph, duals=duals, trip_energy=trip_energy, pull_out_energy=pull_out_energy, pull_in_energy= pull_in_energy ,battery_capacity=battery_capacity)
 
-    else:
-        raise ValueError(f"Unknown sub_problem: {sub_problem}")
+    main_block, main_rc = alns_pricing(
+        trips=trips,
+        graph=graph, 
+        duals=duals, 
+        pull_out_energy=pull_out_energy, 
+        pull_in_energy=pull_in_energy,  
+        bus_params=bus_params
+        )
 
-    if not new_blocks:
+    if main_block:
+        # add main ALNS block
+        candidate_blocks.append((main_block, main_rc))
+
+        # add subcolumns from that one block
+        # sub_cols = generate_contiguous_subcolumns(
+        #     main_block,
+        #     duals,
+        #     graph,
+        #     trip_km,
+        #     bus_params,
+        #     pull_out_energy,
+        #     pull_in_energy,
+        #     min_len=4
+        # )
+        # candidate_blocks.extend(sub_cols)
+
+    if not candidate_blocks:
         print("No improvement found!")
         return False, model, columns
 
     existing_sigs = {tuple(col["trips"]) for col in columns.values()}
     added = 0
 
-    for block, reduced_cost in new_blocks:
+    print(f"Current obj: {current_objective:.2f}")
+    print(f"Main priced block: {main_block}, reduced_cost={main_rc:.3f}")
+
+    for block, rc in candidate_blocks:
         sig = tuple(block)
 
         if sig in existing_sigs:
             continue
-        if reduced_cost >= -1e-3:
+        # ADD BATTERY FEASIBILITY
+        if rc >= -1e-3:
             continue
 
-        block_cost = compute_block_cost(block, graph, trip_km)
+        block_cost = compute_block_cost(block, graph, trip_km, bus_params, pull_out_energy, pull_in_energy)
+
         col_name = f"col_{len(columns)}"
         columns[col_name] = {
             "trips": block,
@@ -252,131 +306,25 @@ def col_gen_step(trips, graph, columns, sub_problem, trip_energy, pull_out_energ
         existing_sigs.add(sig)
         added += 1
 
+        print(f"Added {col_name}: rc={rc:.3f}, cost={block_cost:.2f}, trips={block}")
+
     if added == 0:
         print("No new distinct improving columns added!")
         return False, model, columns
 
     return True, model, columns
 
-class EVSPPricingEnv:
-    def __init__(self, trips_df: pd.DataFrame, graph: Dict[int, List[int]], 
-                 duals: Dict[int, float], block_cost: float = 1000.0, cost_per_km: float = 0.1, max_len: int = 30):
-        self.trips = trips_df.set_index('trip_number')
-        self.graph = graph
-        self.duals = duals
-        self.block_cost = block_cost
-        self.cost_per_km = cost_per_km
-        self.max_len = max_len
-        
-        # All possible trips
-        self.all_trips = sorted(list(graph.keys()))
-        self.trip_to_idx = {t: i for i, t in enumerate(self.all_trips)}
-        self.n_trips = len(self.all_trips)
-        
-        self.reset()
-    
-    def reset(self) -> Tuple[int, np.ndarray]:
-        """Start new block (before any trip)"""
-        self.current_trip = None
-        self.block = []         
-        self.visited_mask = np.zeros(self.n_trips, dtype=bool)
-        self.steps = 0
-        return self._get_state()
-    
-    def _get_state(self) -> Tuple[int, np.ndarray]:
-        """State = (current_trip_idx, visited_mask)"""
-        curr_idx = -1 if self.current_trip is None else self.trip_to_idx[self.current_trip]
-        return curr_idx, self.visited_mask.copy()
-    
-    def get_actions(self) -> List[Any]:
-        """Possible actions: next trips + STOP"""
-        if self.current_trip is None:
-            # Can start at any unvisited trip
-            available = [t for t in self.all_trips if not self.visited_mask[self.trip_to_idx[t]]]
-        else:
-            # Successors of current trip
-            available = [t for t in self.graph[self.current_trip] 
-                        if not self.visited_mask[self.trip_to_idx[t]]]
-        
-        available.append("STOP")
-        return available
-    
-    def step(self, action: Any) -> Tuple[Tuple[int, np.ndarray], float, bool, Dict]:
-        """Take action, return next_state, reward, done, info"""
-        self.steps += 1
-        reward = 0.0
-        done = False
-        info = {}
-        
-        if action == "STOP" or self.steps >= self.max_len:
-            # Terminal: compute reduced cost
-            sum_pi = sum(self.duals[t] for t in self.block)
-            reduced_cost = self.block_cost - sum_pi
-            # Reward = -(block_cost - sum(π_t)) = sum(π_t) - block_cost
-            reward = -reduced_cost  
-            done = True
-            info = {
-                "block": self.block.copy(),
-                "sum_pi": sum_pi,
-                "reduced_cost": reduced_cost,
-                "block_length": len(self.block)
-            }
-        else:
-            # Add trip to block
-            self.current_trip = action
-            self.block.append(action)
-            trip_idx = self.trip_to_idx[action]
-            self.visited_mask[trip_idx] = True
-        
-        return self._get_state(), reward, done, info
-
-
-def random_policy(env) -> Tuple[List[int], float]:
-    """Random policy for testing (replace later with trained RL)"""
-    state = env.reset()
-    done = False
-    
-    while not done:
-        actions = env.get_actions()
-        action = random.choice(actions)
-        state, reward, done, info = env.step(action)
-    
-    return info["block"], info["reduced_cost"]
-
-def greedy_pi_policy(env) -> Tuple[List[int], float]:
-    """Greedy: always pick highest π_t successor"""
-    state = env.reset()
-    done = False
-    
-    while not done:
-        actions = [a for a in env.get_actions() if a != "STOP"]
-        if not actions:
-            # No more trips, stop
-            _, reward, done, info = env.step("STOP")
-            break
-            
-        # Pick highest π_t
-        action = max(actions, key=lambda t: env.duals[t])
-        state, reward, done, info = env.step(action)
-    
-        state, _, done, info = env.step(action)
-    
-    return info['block'], info['reduced_cost']
-
 class ALNSPricingEnv:
     def __init__(self, trips_df: pd.DataFrame, graph: Dict[int, List[Tuple[int, float, float, float]]],
-        duals: Dict[int, float],trip_energy, pull_out_energy, pull_in_energy, battery_capacity, block_cost: float = 244.13, cost_per_km: float = 0.13, max_iter: int = 40,
-        candidate_pool_size: int = 30, reaction_factor: float = 0.2, segment_length: int = 10, seed: int = 42,
+        duals: Dict[int, float], pull_out_energy, pull_in_energy, max_iter: int = 20,
+        candidate_pool_size: int = 30, reaction_factor: float = 0.2, segment_length: int = 10, seed: int | None = None, bus_params = None,
     ):
         self.trips = trips_df.set_index("trip_number")
         self.graph = graph
         self.duals = duals
-        self.block_cost = block_cost
-        self.cost_per_km = cost_per_km
-        self.trip_energy = trip_energy
         self.pull_out_energy = pull_out_energy
         self.pull_in_energy = pull_in_energy
-        self.battery_capacity = battery_capacity
+        self.bus_params = bus_params
         
         # ALNS controls
         self.max_iter = max_iter
@@ -403,14 +351,14 @@ class ALNSPricingEnv:
         self.destroy_ops = {
             "random_remove": self.destroy_random,
             "segment_remove": self.destroy_segment,
-            "worst_remove": self.destroy_worst,
+            # "worst_remove": self.destroy_worst,
         }
  
         # repair operators for ALNS to rebuild block after destruction
         self.repair_ops = {
             "greedy_insert": self.repair_first_improving,
             "best_insert": self.repair_best_insertion,
-            "regret2_insert": self.repair_regret2,
+            # "regret2_insert": self.repair_regret2,
 
         }
 
@@ -431,10 +379,10 @@ class ALNSPricingEnv:
             return False
         
         for k in range(len(block) - 1):
-            if block[k + 1] not in self.successors.get(block[k], set()):
+            if block[k + 1] not in self.successors.get(block[k], []):
                 return False
         
-        soc = self.battery_capacity
+        soc = self.bus_params.battery_capacity_kwh
 
         # depot -> first trip
         soc -= self.pull_out_energy.get(block[0], 0.0)
@@ -445,7 +393,7 @@ class ALNSPricingEnv:
             t = block[i]
 
             # trip energy
-            soc -= self.trip_energy[t]
+            soc -= self.trip_km[t] * self.bus_params.energy_per_km
             if soc < 0:
                 return False
 
@@ -454,10 +402,15 @@ class ALNSPricingEnv:
                 j = block[i+1]
 
                 # find distance from graph
+                found_arc = False
                 for nxt, _, _, dist in self.graph[t]:
                     if nxt == j:
-                        soc -= dist * 0.13
+                        soc -= dist * self.bus_params.energy_per_km
+                        found_arc = True
                         break
+
+                if not found_arc:
+                    return False
 
                 if soc < 0:
                     return False
@@ -474,9 +427,10 @@ class ALNSPricingEnv:
         return compute_block_cost(
             block,
             self.graph,
-            trip_km=self.trip_km,
-            fixed_cost=self.block_cost,
-            cost_per_km=self.cost_per_km
+            self.trip_km,
+            self.bus_params,
+            self.pull_out_energy,
+            self.pull_in_energy
         )
 
     def reduced_cost(self, block: List[int]) -> float:
@@ -485,32 +439,47 @@ class ALNSPricingEnv:
             return float("inf")
         return self.block_cost_value(block) - sum(self.duals.get(t, 0.0) for t in block)
 
+
     def candidate_trips(self) -> List[int]:
-        "All trips are used as ALNS candidate trips"
-        return self.trip_ids.copy()
-    
+        ranked = sorted(
+            self.trip_ids,
+            key=lambda t: self.duals.get(t, 0.0),
+            reverse=True
+        )
+
+        top_k = ranked[:min(self.candidate_pool_size, len(ranked))]
+        self.random.shuffle(top_k)
+        return top_k
+
     def initial_solution(self) -> List[int]:
-        "Build the starting block for ALNS"
         candidates = self.candidate_trips()
         if not candidates:
             return []
 
-        # pick the top 10 trips with highest dual values
-        seed_list = sorted(candidates, key=lambda t: self.duals.get(t, 0.0), reverse=True)[:10]
+        ranked = sorted(
+            candidates,
+            key=lambda t: self.duals.get(t, 0.0),
+            reverse=True
+        )
+
+        pool_size = min(50, len(ranked))
+        seed_pool = ranked[:pool_size]
+
+        n_seeds = min(10, len(seed_pool))
+        seed_list = self.random.sample(seed_pool, n_seeds)
+
         best_block = [seed_list[0]]
         best_rc = self.reduced_cost(best_block)
 
         for seed in seed_list:
             block = [seed]
-
             improved = True
 
-            # greedily extend the 1 trip block by adding successor if it improves reduced cost
             while improved:
                 improved = False
                 last = block[-1]
 
-                nbrs = list(self.successors.get(last, set()))
+                nbrs = list(self.successors.get(last, []))
                 self.random.shuffle(nbrs)
 
                 for nxt in nbrs:
@@ -523,7 +492,6 @@ class ALNSPricingEnv:
                         improved = True
                         break
 
-            # keep the best seed-generated block
             rc = self.reduced_cost(block)
             if rc < best_rc:
                 best_block = block
@@ -825,8 +793,13 @@ class ALNSPricingEnv:
                 self.update_scores(d_name, r_name, "rejected")
 
             # early stop: pricing only needs one negative reduced-cost column
-            if best_rc < -1e-3:
+            # if best_rc < -1e-3:
+            #     return s_best, best_rc
+            
+            if it >= 5 and best_rc < -1e-3:
                 return s_best, best_rc
+            
+            
 
             # update the weight every segment
             if it % self.segment_length == 0:
@@ -839,75 +812,7 @@ class ALNSPricingEnv:
 
         return s_best, best_rc
 
-def alns_pricing_multi(trips, graph, duals, trip_energy, pull_out_energy, pull_in_energy, battery_capacity = 160, n_runs=4, max_cols=4):
-    "Run ALNS multiple times with different random seeds, and keeping the best 6 columns"
-    "Every CG iteration produces 4 best columns instead of 1 per iteration."
-
-    found = {}
-
-    for run in range(n_runs):
-        pricer = ALNSPricingEnv(
-            trips_df=trips,
-            graph=graph,
-            duals=duals,
-            trip_energy=trip_energy,
-            pull_out_energy=pull_out_energy,
-            pull_in_energy=pull_in_energy,
-            battery_capacity=battery_capacity,  
-            block_cost=1000.0, # artificially use block cost of 1000 instead of real bus cost to reduce number of buses used
-            cost_per_km=0.13,
-            max_iter=20,
-            candidate_pool_size=len(trips),
-            reaction_factor=0.2,
-            segment_length=10,
-            seed=42 + run,
-            # seed = random.randint(0,10**6),
-        )
-
-        block, rc = pricer.solve()
-
-        if block and rc < -1e-6:
-            sig = tuple(block)
-            if sig not in found or rc < found[sig]:
-                found[sig] = rc
-
-    results = [(list(sig), rc) for sig, rc in found.items()]
-    results.sort(key=lambda x: x[1])  # most negative first
-    return results[:max_cols]
-
-def pricing_multi_columns(trips, graph, duals, trip_energy, pull_out_energy, pull_in_energy, battery_capacity):
-    "Run ALNS several times, keep full blocks and generate contiguous subcolumns from each block"
-    candidates = []
-
-    trip_km = {row.trip_number: row.distance_km for row in trips.itertuples(index=False)}
-
-    # print("  pricing: start ALNS multi")
-    # keep the 5 best columns
-    alns_cols = alns_pricing_multi(trips, graph, duals, trip_energy, pull_out_energy, pull_in_energy, battery_capacity)
-    # print(f"  pricing: ALNS multi returned {len(alns_cols)} columns")
-
-    for block, rc in alns_cols:
-        if not block:
-            continue
-
-        candidates.append((block, rc))
-
-        sub_cols = generate_contiguous_subcolumns(block, duals, graph, trip_km, min_len=2)
-        candidates.extend(sub_cols)
-
-    best_by_block = {}
-    for block, rc in candidates:
-        sig = tuple(block)
-        if sig not in best_by_block or rc < best_by_block[sig]:
-            best_by_block[sig] = rc
-
-    results = [(list(sig), rc) for sig, rc in best_by_block.items()]
-    results.sort(key=lambda x: x[1])
-
-    # print(f"  pricing: total distinct improving columns {len(results)}")
-    return results
-
-def generate_contiguous_subcolumns(block, duals, graph, trip_km, min_len=2):
+def generate_contiguous_subcolumns(block, duals, graph, trip_km, bus_params, pull_out_energy, pull_in_energy, min_len=2):
     "Generate all contiguous subcolumns from a block"
     results = []
     n = len(block)
@@ -915,7 +820,7 @@ def generate_contiguous_subcolumns(block, duals, graph, trip_km, min_len=2):
     for start in range(n):
         for end in range(start + min_len, n + 1):
             sub = block[start:end]
-            cost = compute_block_cost(sub, graph, trip_km)
+            cost = compute_block_cost(sub, graph, trip_km, bus_params, pull_out_energy, pull_in_energy)
             rc = cost - sum(duals.get(t, 0.0) for t in sub)
 
             if rc < -1e-6:
@@ -923,37 +828,43 @@ def generate_contiguous_subcolumns(block, duals, graph, trip_km, min_len=2):
 
     return results
 
-def rebuild_columns_with_real_costs(trips, graph, columns, real_fixed_cost=244.13, cost_per_km=0.13):
-    "Rebuild final columns with real fixed costs, instead of 1000"
-    trip_km = {row.trip_number: row.distance_km for row in trips.itertuples(index=False)}
 
-    real_columns = {}
+def prune_columns_for_final_solve(columns, max_non_singletons=600):
+    "Prune columns before solving final master to reduce running time"
+    "Keeps als singleton blocks, and most promising blocks with longer columns and longer cost"
+
+    singleton_cols = {}
+    non_singleton_cols = []
+
     for name, col in columns.items():
-        real_columns[name] = {
-            "trips": col["trips"],
-            "cost": compute_block_cost(
-                col["trips"],
-                graph,
-                trip_km,
-                fixed_cost=real_fixed_cost,
-                cost_per_km=cost_per_km
-            )
-        }
+        if len(col["trips"]) == 1:
+            singleton_cols[name] = col
+        else:
+            non_singleton_cols.append((name, col))
 
-    return real_columns
+    non_singleton_cols.sort(key=lambda x: (-len(x[1]["trips"]), x[1]["cost"]))
+    kept_non_singletons = non_singleton_cols[:max_non_singletons]
 
-def build_depot_energy_lookup(arcs_df, energy_consumption_per_km=1.3):
-    pull_out_energy = {}
-    pull_in_energy = {}
+    pruned = dict(singleton_cols)
+    for name, col in kept_non_singletons:
+        pruned[name] = col
 
-    for row in arcs_df.itertuples(index=False):
+    return pruned
 
-        if row.arc_type == "pull_out":
-            # DEPOT -> trip
-            pull_out_energy[row.to_stop] = row.distance_km * energy_consumption_per_km
-
-        elif row.arc_type == "pull_in":
-            # trip -> DEPOT
-            pull_in_energy[row.from_stop] = row.distance_km * energy_consumption_per_km
-
-    return pull_out_energy, pull_in_energy
+def alns_pricing(trips, graph, duals, pull_out_energy, pull_in_energy, bus_params):
+    "Run one ALNS pricing solve and return one improving block."
+    
+    pricer = ALNSPricingEnv(
+        trips_df=trips,
+        graph=graph,
+        duals=duals,
+        pull_out_energy=pull_out_energy,
+        pull_in_energy=pull_in_energy, 
+        max_iter=20,
+        candidate_pool_size=50,
+        reaction_factor=0.2,
+        segment_length=10,
+        seed=None,
+        bus_params=bus_params
+    )
+    return pricer.solve()
