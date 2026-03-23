@@ -26,7 +26,7 @@ def solve_final_integer_master(trips, columns):
     for t in trip_ids:
         model += pulp.lpSum(x[name] for name, col in columns.items() if t in col["trips"]) == 1, f"cover_{t}"
 
-    solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=60)
+    solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=300)
     model.solve(solver)
     return model, {name: pulp.value(x[name]) for name in columns}
 
@@ -71,7 +71,7 @@ def save_viz_data(buses: list[float], costs: list[float], total_cost: float, tot
         json.dump(viz_data, f, indent=4)
 
 def main():
-    dataset_name = "qlink_3,7,8"
+    dataset_name = "qlink_3"
     start = perf_counter()
     UTR_trips = f'{dataset_name}/trips.txt'
     trips = parse_trips(UTR_trips)
@@ -87,7 +87,7 @@ def main():
     arcs_df = pd.DataFrame(arcs)
     graph = build_trip_graph_from_arcs_df(trips, arcs_df)
     columns = init_columns(trips)
-    max_iter = 500
+    max_iter = 1000
     
     _, state_dim, n_actions = get_env_dummy(trips, graph, arcs_df)
     pull_out = arcs_df[arcs_df['arc_type'] == 'pull_out']['to_stop'].unique()

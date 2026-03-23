@@ -62,7 +62,13 @@ class EVSPPricingEnv:
         info = {}
 
         if action == "STOP" or self.steps >= self.max_len:
-            reduced_cost = (self.block_cost + self.cumulative_time_cost) - self.cumulative_pi
+            battery_cost = 0.0
+            if self.bus_params:
+                energy_used = self.bus_params.battery_capacity_kwh - self.remaining_battery
+                battery_pct = min(energy_used / self.bus_params.battery_capacity_kwh, 1.0)
+                battery_cost = battery_pct * self.bus_params.full_recharge_cost
+            
+            reduced_cost = (self.block_cost + self.cumulative_time_cost + battery_cost) - self.cumulative_pi
             reward = -reduced_cost
             done = True
             info = {
