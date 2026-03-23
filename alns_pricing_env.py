@@ -43,14 +43,14 @@ class ALNSPricingEnv:
         self.destroy_ops = {
             "random_remove": self.destroy_random,
             "segment_remove": self.destroy_segment,
-            # "worst_remove": self.destroy_worst,
+            "worst_remove": self.destroy_worst,
         }
  
         # repair operators for ALNS to rebuild block after destruction
         self.repair_ops = {
             "greedy_insert": self.repair_first_improving,
             "best_insert": self.repair_best_insertion,
-            # "regret2_insert": self.repair_regret2,
+            "regret2_insert": self.repair_regret2,
 
         }
 
@@ -207,7 +207,8 @@ class ALNSPricingEnv:
             return block.copy()
 
         if q is None:
-            q = 1 if len(block) < 4 else 2
+            max_remove = min(5, len(block) - 1)  # cap at 5 removals
+            q = self.random.randint(1, max_remove)
 
         q = min(q, len(block) - 1)
         idxs = sorted(self.random.sample(range(len(block)), q), reverse=True)
@@ -224,7 +225,8 @@ class ALNSPricingEnv:
             return block.copy()
 
         if q is None:
-            q = 1 if len(block) < 4 else 2
+            max_remove = min(5, len(block) - 1)  # cap at 5 removals
+            q = self.random.randint(1, max_remove)
 
         q = min(q, len(block) - 1)
         start = self.random.randint(0, len(block) - q)
@@ -455,6 +457,8 @@ class ALNSPricingEnv:
         self.destroy_attempts = {k: 0 for k in self.destroy_ops}
         self.repair_attempts = {k: 0 for k in self.repair_ops}
 
+        
+
     def solve(self) -> Tuple[List[int], float]:
         "Run ALNS until max_iter or until a negative reduced costs block is found"
         s = self.initial_solution()
@@ -465,10 +469,17 @@ class ALNSPricingEnv:
         best_rc = self.reduced_cost(s_best)
         temperature = 3.0
 
+        destroy_counts = {name: 0 for name in self.destroy_ops}
+        repair_counts = {name: 0 for name in self.repair_ops}
+
         for it in range(1, self.max_iter + 1):
+
             # choose operators
             d_name = self.select_operator(self.destroy_weights)
             r_name = self.select_operator(self.repair_weights)
+
+            destroy_counts[d_name] += 1
+            repair_counts[r_name] += 1
 
             destroy = self.destroy_ops[d_name]
             repair = self.repair_ops[r_name]
@@ -498,8 +509,8 @@ class ALNSPricingEnv:
             # if best_rc < -1e-3:
             #     return s_best, best_rc
             
-            if it >= 5 and best_rc < -1e-3:
-                return s_best, best_rc
+            if it >= 100 and best_rc < -1e-3:
+                return s_best, best_rc, destroy_counts, repair_counts
             
             
 
@@ -512,4 +523,4 @@ class ALNSPricingEnv:
             # decrease the temperature to not less worse solutions over time
             temperature *= 0.99
 
-        return s_best, best_rc
+        return s_best, best_rc, destroy_counts, repair_counts

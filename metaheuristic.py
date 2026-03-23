@@ -84,7 +84,7 @@ def save_viz_data(buses: list[float], costs: list[float], total_cost: float, dat
 def main():
     start = perf_counter()
 
-    dataset = "qlink_3,7,8"
+    dataset = "qlink_3"
 
     UTR_trips = f'{dataset}/trips.txt'
     trips = parse_trips(UTR_trips)
@@ -109,13 +109,24 @@ def main():
     buses_history = []
     costs_history = []
 
+    total_destroy_counts = {}
+    total_repair_counts = {}
+
     for i in range(max_iters):
  
-        improved, model, columns = col_gen_step(trips=trips, graph=graph, columns=columns,
+        improved, model, columns, destroy_count, repair_count = col_gen_step(trips=trips, graph=graph, columns=columns,
         pull_out_energy=pull_out_energy,
         pull_in_energy=pull_in_energy,
         bus_params=bus_params
         )
+
+        # accumulate destroy counts
+        for k, v in destroy_count.items():
+            total_destroy_counts[k] = total_destroy_counts.get(k, 0) + v
+
+        # accumulate repair counts
+        for k, v in repair_count.items():
+            total_repair_counts[k] = total_repair_counts.get(k, 0) + v
 
         current_cost = pulp.value(model.objective)
 
@@ -182,16 +193,25 @@ def main():
 
     print(f"CPU Time: {running_time:.4f} seconds")
 
-    save_viz_data(
-        buses=buses_history,
-        costs=costs_history,
-        total_cost=cost,
-        dataset=dataset,
-        max_iters=max_iters,
-        total_buses=bus_count,
-        runtime=running_time
-    )
+    # save_viz_data(
+    #     buses=buses_history,
+    #     costs=costs_history,
+    #     total_cost=cost,
+    #     dataset=dataset,
+    #     max_iters=max_iters,
+    #     total_buses=bus_count,
+    #     runtime=running_time
+    # )
 
+
+
+    print("\nTotal destroy operator usage:")
+    for k, v in total_destroy_counts.items():
+        print(f"{k}: {v}")
+
+    print("\nTotal repair operator usage:")
+    for k, v in total_repair_counts.items():
+      print(f"{k}: {v}")
 
 if __name__ == '__main__':
     main()

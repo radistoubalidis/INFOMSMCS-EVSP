@@ -253,7 +253,7 @@ def col_gen_step(trips, graph, columns, pull_out_energy, pull_in_energy, bus_par
 
 
     # run ALNS to find a new block
-    main_block, main_rc = alns_pricing(
+    main_block, main_rc, destroy_count, repair_count = alns_pricing(
         trips=trips,
         graph=graph, 
         duals=duals, 
@@ -275,13 +275,13 @@ def col_gen_step(trips, graph, columns, pull_out_energy, pull_in_energy, bus_par
             bus_params,
             pull_out_energy,
             pull_in_energy,
-            min_len=4
+            min_len=2
         )
         candidate_blocks.extend(sub_cols)
 
     if not candidate_blocks:
         print("No improvement found!")
-        return False, model, columns
+        return False, model, columns, destroy_count, repair_count
 
     existing_sigs = {tuple(col["trips"]) for col in columns.values()}
     added = 0
@@ -315,9 +315,9 @@ def col_gen_step(trips, graph, columns, pull_out_energy, pull_in_energy, bus_par
 
     if added == 0:
         print("No new distinct improving columns added!")
-        return False, model, columns
+        return False, model, columns, destroy_count, repair_count
 
-    return True, model, columns
+    return True, model, columns, destroy_count, repair_count
 
 def generate_contiguous_subcolumns(block, duals, graph, trip_km, bus_params, pull_out_energy, pull_in_energy, min_len=2):
     "Generate all contiguous subcolumns from a block with length at least min_len"
@@ -344,10 +344,10 @@ def alns_pricing(trips, graph, duals, pull_out_energy, pull_in_energy, bus_param
         duals=duals,
         pull_out_energy=pull_out_energy,
         pull_in_energy=pull_in_energy, 
-        max_iter=20,
+        max_iter=100,
         candidate_pool_size=50,
         reaction_factor=0.2,
-        segment_length=10,
+        segment_length=25,
         seed=None,
         bus_params=bus_params
     )
