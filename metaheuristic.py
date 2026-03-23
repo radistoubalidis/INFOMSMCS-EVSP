@@ -84,7 +84,7 @@ def save_viz_data(buses: list[float], costs: list[float], total_cost: float, dat
 def main():
     start = perf_counter()
 
-    dataset = "qlink_3"
+    dataset = "qlink_3,7,8"
 
     UTR_trips = f'{dataset}/trips.txt'
     trips = parse_trips(UTR_trips)
@@ -193,15 +193,15 @@ def main():
 
     print(f"CPU Time: {running_time:.4f} seconds")
 
-    # save_viz_data(
-    #     buses=buses_history,
-    #     costs=costs_history,
-    #     total_cost=cost,
-    #     dataset=dataset,
-    #     max_iters=max_iters,
-    #     total_buses=bus_count,
-    #     runtime=running_time
-    # )
+    save_viz_data(
+        buses=buses_history,
+        costs=costs_history,
+        total_cost=cost,
+        dataset=dataset,
+        max_iters=max_iters,
+        total_buses=bus_count,
+        runtime=running_time
+    )
 
 
 
